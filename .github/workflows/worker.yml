@@ -1,0 +1,35 @@
+name: Manual Video Ingestion Worker
+
+on:
+  workflow_dispatch:
+
+jobs:
+  run-worker:
+    runs-on: ubuntu-latest
+
+    steps:
+    - name: Check out repository code
+      uses: actions/checkout@v4
+
+    - name: Set up Python
+      uses: actions/setup-python@v5
+      with:
+        python-version: '3.10'
+
+    - name: Install System Dependencies
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y aria2 mediainfo curl
+
+    - name: Install Python Dependencies
+      run: |
+        pip install -r requirements.txt
+
+    - name: Execute Ingestion Engine
+      env:
+        GOOGLE_SHEETS_JSON: ${{ secrets.GOOGLE_SHEETS_JSON }}
+        VIDARA_API_KEY: ${{ secrets.VIDARA_API_KEY }}
+        ADMIN_KEY: ${{ secrets.ADMIN_KEY }}
+        # This fallback setup ensures it reads the ID whether you saved it as a secret or variable
+        SPREADSHEET_ID: ${{ secrets.SPREADSHEET_ID || vars.SPREADSHEET_ID || '1KYxYMv9hOKGvfKNpH2SnZ9cXrNMISuVcnhZ7__EgBac' }}
+      run: python main.py
