@@ -8,28 +8,28 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-      - name: Check out repository code
-        uses: actions/checkout@v4
+    - name: Check out repository code
+      uses: actions/checkout@v4
 
-      - name: Set up Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: "3.10"
+    - name: Set up Python
+      uses: actions/setup-python@v5
+      with:
+        python-version: '3.10'
 
-      - name: Install System Dependencies
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y aria2 mediainfo curl
+    - name: Install System Dependencies
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y aria2 mediainfo curl
 
-      - name: Install Python Dependencies
-        run: |
-          python -m pip install --upgrade pip
-          pip install -r requirements.txt
+    - name: Install Python Dependencies
+      run: |
+        pip install -r requirements.txt
 
-      - name: Execute Series Ingestion Engine
-        env:
-          GOOGLE_SHEETS_JSON: ${{ secrets.GOOGLE_SHEETS_JSON }}
-          VIDARA_API_KEY: ${{ secrets.VIDARA_API_KEY }}
-          ADMIN_KEY: ${{ secrets.ADMIN_KEY }}
-          SPREADSHEET_ID: ${{ vars.SPREADSHEET_ID }}
-        run: python series_worker.py
+    - name: Execute Series Ingestion Engine
+      env:
+        GOOGLE_SHEETS_JSON: ${{ secrets.GOOGLE_SHEETS_JSON }}
+        VIDARA_API_KEY: ${{ secrets.VIDARA_API_KEY }}
+        ADMIN_KEY: ${{ secrets.ADMIN_KEY }}
+        # Fallback logic to read the ID regardless of how it's stored in GitHub
+        SPREADSHEET_ID: ${{ secrets.SPREADSHEET_ID || vars.SPREADSHEET_ID || '11VbSz90oR87pDAqxDY-Zyrg4NNM3LgPxKynjqlzIueM' }}
+      run: python series_worker.py
