@@ -124,13 +124,9 @@ def fetch_active_upload_server():
 upload_server = fetch_active_upload_server()
 
 def synchronize_cms_database(tmdb_id, season_num, episode_num, file_url, languages):
-    """
-    Ported directly from your working validation blueprint logic.
-    Handles existing entities (409) and properly discovers sub-element structural IDs.
-    """
     print(f"\n======================================================================")
     print(f"STARTING BULLETPROOF SERIES INGESTION FOR TMDB: {tmdb_id}")
-    print(f"TARGETING: S{season_num:02d}E{episode_num:02d}")
+    print(f"TARGETING: S{season_num:02d} E{episode_num:02d}")
     print(f"======================================================================")
     
     admin_headers = {
@@ -355,7 +351,8 @@ for idx, row in enumerate(all_rows):
                 
                 langs = parse_media_languages(extracted_path)
                 short_langs = [l[:3] for l in langs]
-                renamed_filename = f"{tmdb_name} S{final_s:02d}E{final_e:02d} {' '.join(short_langs)}{Path(extracted_path).suffix}"
+                # CHANGED: Added space between S and E tag arrays
+                renamed_filename = f"{tmdb_name} S{final_s:02d} E{final_e:02d} {' '.join(short_langs)}{Path(extracted_path).suffix}"
 
                 upload_queue.put({
                     "path": extracted_path, "row_idx": row_idx, "tmdb_id": tmdb_id,
@@ -389,7 +386,8 @@ for idx, row in enumerate(all_rows):
             langs = parse_media_languages(local_target_path)
             short_langs = [l[:3] for l in langs]
             
-            renamed_filename = f"{tmdb_name} S{int(season):02d}E{int(episode):02d} {' '.join(short_langs)}{Path(local_target_path).suffix}"
+            # CHANGED: Added space between S and E tag arrays
+            renamed_filename = f"{tmdb_name} S{int(season):02d} E{int(episode):02d} {' '.join(short_langs)}{Path(local_target_path).suffix}"
             final_moved_path = os.path.join(OUTPUT_FOLDER, renamed_filename)
             shutil.move(local_target_path, final_moved_path)
 
