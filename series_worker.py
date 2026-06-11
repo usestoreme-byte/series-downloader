@@ -125,85 +125,127 @@ upload_server = fetch_active_upload_server()
 
 def synchronize_cms_database(tmdb_id, season_num, episode_num, file_url, languages):
     """
-    Automates layout discovery, initializes series/seasons when missing,
-    and attaches links with standardized metadata.
+    Ported directly from your working validation blueprint logic.
+    Handles existing entities (409) and properly discovers sub-element structural IDs.
     """
     print(f"\n======================================================================")
     print(f"STARTING BULLETPROOF SERIES INGESTION FOR TMDB: {tmdb_id}")
     print(f"TARGETING: S{season_num:02d}E{episode_num:02d}")
+    print(f"======================================================================")
     
-    admin_headers = {"x-admin-key": ADMIN_KEY, "Content-Type": "application/json"}
-    
-    # STEP 1: Core Content Ingestion Handshake
-    print("[STEP 1] Running Master TMDB Import / Verification...")
-    import_res = requests.post(f"{ADMIN_BASE_URL}/admin/import/series", headers=admin_headers, json={"tmdb_id": int(tmdb_id)}, timeout=30)
-    if import_res.status_code not in [200, 201]:
-        print(f"-> [ERROR] Failed TMDB baseline verification. Code: {import_res.status_code}")
-        return False
-
-    # STEP 2: Database Structural Index Discovery
-    print("[STEP 2] Fetching internal layout mapping indices via TMDB ID...")
-    meta_res = requests.get(f"{ADMIN_BASE_URL}/admin/series/{tmdb_id}", headers=admin_headers, timeout=30)
-    if meta_res.status_code != 200:
-        return False
-        
-    series_data = meta_res.json()
-    series_db_id = series_data.get("id") or series_data.get("result", {}).get("id")
-    
-    # Locate targeted execution structural components
-    seasons_list = series_data.get("seasons", []) or series_data.get("result", {}).get("seasons", [])
-    season_db_id = None
-    for s in seasons_list:
-        if s.get("season_number") == int(season_num):
-            season_db_id = s.get("id")
-            break
-            
-    if not season_db_id:
-        print(f"-> [INFO] Season missing. Syncing container array...")
-        sync_res = requests.post(f"{ADMIN_BASE_URL}/admin/series/{series_db_id}/sync-seasons", headers=admin_headers, timeout=30)
-        if sync_res.status_code in [200, 201]:
-            # Refetch updated internal metadata layout
-            series_data = requests.get(f"{ADMIN_BASE_URL}/admin/series/{tmdb_id}", headers=admin_headers, timeout=30).json()
-            seasons_list = series_data.get("seasons", []) or series_data.get("result", {}).get("seasons", [])
-            for s in seasons_list:
-                if s.get("season_number") == int(season_num):
-                    season_db_id = s.get("id")
-                    break
-
-    if not series_db_id or not season_db_id:
-        print("-> [CRITICAL] Internal structural map location failure.")
-        return False
-
-    print(f"-> [SUCCESS] Series DB ID: [{series_db_id}] | Season DB ID: [{season_db_id}]")
-
-    # STEP 3: Epizodic Target Isolation
-    episodes_res = requests.get(f"{ADMIN_BASE_URL}/admin/season/{season_db_id}/episodes", headers=admin_headers, timeout=30)
-    if episodes_res.status_code != 200:
-        return False
-        
-    ep_list = episodes_res.json() if isinstance(episodes_res.json(), list) else episodes_res.json().get("result", [])
-    episode_db_id = None
-    for ep in ep_list:
-        if ep.get("episode_number") == int(episode_num):
-            episode_db_id = ep.get("id")
-            break
-
-    if not episode_db_id:
-        print(f"-> [WARN] Target Episode entry footprint unindexed on backend.")
-        return False
-
-    # STEP 4: Injection of Complete Payload
-    short_tags = [lang[:3] for lang in languages]
-    link_payload = {
-        "url": file_url,
-        "quality": "1080p",
-        "audio_languages": json.dumps(short_tags),
-        "has_subtitles": 1
+    admin_headers = {
+        "x-admin-key": ADMIN_KEY,
+        "Content-Type": "application/json"
     }
     
-    link_res = requests.post(f"{ADMIN_BASE_URL}/admin/episode/{episode_db_id}/link", headers=admin_headers, json=link_payload, timeout=30)
-    print(f"[STEP 4] Injecting remote storage pointers -> status code: {link_res.status_code}")
-    return link_res.status_code in [200, 201]
+    try:
+        # STEP 1: IMPORT / VERIFY THE PARENT SERIES ENVELOPE
+        print("[STEP 1] Running Master TMDB Import / Verification...")
+        series_res = requests.post(
+            f"{ADMIN_BASE_URL}/admin/import/series",
+            headers=admin_headers,
+            json={"tmdb_id": int(tmdb_id)},
+            timeout=30
+        )
+
+        if series_res.status_code == 409:
+            print("-> [INFO] Series already initialized in database.")
+        else:
+            series_res.raise_for_status()
+            print("-> [SUCCESS] New series imported successfully.")
+
+        # STEP 2: RESOLVE THE INTERNAL DB SERIES ID & SEASON ID
+        print(f"[STEP 2] Fetching internal layout mapping indices via TMDB ID...")
+        seasons_res = requests.get(
+            f"{ADMIN_BASE_URL}/series/{tmdb_id}/seasons",
+            headers=admin_headers,
+            timeout=30
+        )
+        seasons_res.raise_for_status()
+        seasons_list = seasons_res.json()
+
+        if not seasons_list or not isinstance(seasons_list, list):
+            print(f"-> [ERROR] Failed to fetch a valid season mapping schema: {seasons_list}")
+            return False
+
+        internal_series_id = seasons_list[0].get("series_id")
+        internal_season_id = None
+
+        for target_season in seasons_list:
+            s_num = target_season.get("season_number") or target_season.get("seasonNumber")
+            if s_num == int(season_num):
+                internal_season_id = target_season.get("id")
+                break
+
+        if not internal_series_id or not internal_season_id:
+            print("-> [ERROR] Could not isolate internal relational DB IDs.")
+            return False
+
+        print(f"-> [SUCCESS] Series DB ID: [{internal_series_id}] | Season DB ID: [{internal_season_id}]")
+
+        # STEP 3: SYNC THE TARGET SEASON TRACK STRUCTURE
+        print(f"[STEP 3] Synchronizing season tracks via Internal Series ID [{internal_series_id}]...")
+        sync_res = requests.post(
+            f"{ADMIN_BASE_URL}/admin/series/{internal_series_id}/sync-season/{int(season_num)}",
+            headers=admin_headers,
+            timeout=45
+        )
+
+        if sync_res.status_code == 409:
+            print("-> [INFO] Season structural metadata matches existing records.")
+        else:
+            sync_res.raise_for_status()
+            print("-> [SUCCESS] Worker season-to-episode mapping synchronized.")
+
+        # STEP 4: RESOLVE THE INTERNAL EPISODE ID
+        print(f"[STEP 4] Fetching current episode table list for Season ID [{internal_season_id}]...")
+        episodes_res = requests.get(
+            f"{ADMIN_BASE_URL}/seasons/{internal_season_id}/episodes",
+            headers=admin_headers,
+            timeout=30
+        )
+        episodes_res.raise_for_status()
+        episodes_list = episodes_res.json()
+
+        internal_episode_id = None
+        for ep in episodes_list:
+            ep_num = ep.get("episode_number") or ep.get("episodeNumber")
+            if ep_num == int(episode_num):
+                internal_episode_id = ep.get("id")
+                break
+
+        if not internal_episode_id:
+            print(f"-> [ERROR] Target episode tracking index missing for Episode {episode_num}.")
+            return False
+
+        print(f"-> [SUCCESS] Target Episode localized. Internal Episode Table ID: {internal_episode_id}")
+
+        # STEP 5: ATTACH LINK USING PRE-STRINGIFIED ARRAY PATCH
+        print(f"[STEP 5] Injecting stream content payload into Episode node: {internal_episode_id}...")
+        link_payload = {
+            "url": file_url,
+            "quality": "1080p",
+            "audio_languages": json.dumps(languages),
+            "has_subtitles": 1
+        }
+
+        link_res = requests.post(
+            f"{ADMIN_BASE_URL}/admin/episode/{internal_episode_id}/link",
+            headers=admin_headers,
+            json=link_payload,
+            timeout=30
+        )
+
+        if link_res.status_code in [200, 201]:
+            print(f"🎉 SERIES EPISODE LINKED SUCCESSFULLY TO CMS! ID: {internal_episode_id}")
+            return True
+        else:
+            print(f"-> [ERROR] Failed link injection call: {link_res.status_code} - {link_res.text}")
+            return False
+
+    except Exception as exc:
+        print(f"-> [CRITICAL RUNTIME ERROR] Pipeline sync step trace failure: {exc}")
+        return False
 
 # ==============================================================================
 # MULTI-THREADED ASYNC UPLOAD DISPATCHER
@@ -239,13 +281,13 @@ def upload_processor_worker(worker_id):
                     data = res.json()
                     final_url = data.get("filecode") or data.get("url") or data.get("result", {}).get("url")
                     if final_url:
-                        # Process database injection mapping sequence
                         db_synced = synchronize_cms_database(tmdb_id, season_num, episode_num, final_url, languages)
                         
-                        with lock:
-                            if row_idx not in uploaded_links_tracker:
-                                uploaded_links_tracker[row_idx] = []
-                            uploaded_links_tracker[row_idx].append(final_url)
+                        if db_synced:
+                            with lock:
+                                if row_idx not in uploaded_links_tracker:
+                                    uploaded_links_tracker[row_idx] = []
+                                uploaded_links_tracker[row_idx].append(final_url)
                         success = True
                         break
 
@@ -308,7 +350,6 @@ for idx, row in enumerate(all_rows):
                 extracted_path = archive.extract(file_info, OUTPUT_FOLDER)
                 s_extracted, e_extracted = get_episode_code(os.path.basename(extracted_path))
                 
-                # Use track codes extracted from filename fallback to row structural defaults
                 final_s = s_extracted if s_extracted is not None else int(season)
                 final_e = e_extracted if e_extracted is not None else 1
                 
@@ -324,7 +365,6 @@ for idx, row in enumerate(all_rows):
         try: os.remove(target_zip_path)
         except Exception: pass
 
-        # Wait until current rows items drain to prevent index shifting on multi-batch tracks
         upload_queue.join()
         
         links_pushed = uploaded_links_tracker.get(row_idx, [])
