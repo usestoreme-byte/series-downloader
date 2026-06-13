@@ -8,11 +8,14 @@ import zipfile
 import threading
 import time
 import subprocess
+import asyncio
 from pathlib import Path
 import gspread
 from google.oauth2.service_account import Credentials
 from pymediainfo import MediaInfo
 from requests_toolbelt.multipart.encoder import MultipartEncoder, MultipartEncoderMonitor
+from telethon import TelegramClient
+from telethon.sessions import StringSession
 
 print("=" * 60)
 print("INITIALIZING WORKER CONTAINER ENVIRONMENT (SERIES ENGINE)")
@@ -44,6 +47,12 @@ RAW_SPREADSHEET_ID = os.environ.get("SPREADSHEET_ID", "1KYxYMv9hOKGvfKNpH2SnZ9cX
 SPREADSHEET_ID = RAW_SPREADSHEET_ID.replace("'", "").replace('"', '').strip()
 ADMIN_KEY = os.environ.get("ADMIN_KEY", "*Chandu2030#@").strip()
 
+# --- TELEGRAM SECURE SETTING INDICES ---
+TG_API_ID = 39631214               
+TG_API_HASH = '341da0c5a267f02ccc36efe6582049e6'     
+TG_CHANNEL_ID = -1003955675609     
+TG_SESSION_STRING = '1BVtsOKIBuyd2azy_Bxc7MjrHCDqkHzz5efA_jfCJgNL1_aOTcNyV2psFZWq58OdTntp7ALXuS6i1AudE96qvNfHsWYUK0VTSf-_0LEHEHvS7Qp4uSxUNDbXzVi5pnKikjNA7Rv7yH79WxpnzDuuRsMfVqs47rbx0h_xYSon3PK9mK6CRyLUKci9ywHrq5Xifp18ZPXXsbPAsmpoY4aJDElXU_LHWPwoK0Yo_VZ4TECeWuhcOwiK18mE0gzJaqWQE9vsxMNaufUxGgwaPuKDOlwmYuptsq5XdnRTChtlBcmAclEeWPcZNniJcKD-EOgaI5BONLdw8WL6rRxx53PukvGUEBMqmki4='
+
 BASE_DIR = "./media_work"
 TEMP_FOLDER = f"{BASE_DIR}/temp_downloads"
 OUTPUT_FOLDER = f"{BASE_DIR}/processed"
@@ -69,8 +78,10 @@ uploaded_links_tracker = {} # Maps row_idx -> list of generated final links
 lock = threading.Lock()
 
 # Global tracking directory cache to prevent redundant API queries per thread execution
-# Structure: {(tmdb_id, season_number): folder_id}
 folder_id_cache = {}
+
+# Initialize Telethon Client Context
+tg_client = TelegramClient(StringSession(TG_SESSION_STRING), TG_API_ID, TG_API_HASH)
 
 # ==============================================================================
 # SPREADSHEET INGESTION & HEADER MAPPING
@@ -128,20 +139,13 @@ def fetch_active_upload_server():
 upload_server = fetch_active_upload_server()
 
 def get_or_create_vidara_folder(tmdb_id, tmdb_name, season_num):
-    """
-    Thread-safe directory checking mechanism that evaluates whether an active 
-    Vidara system remote target node folder reference ID exists, or creates one.
-    """
     cache_key = (str(tmdb_id).strip(), int(season_num))
-    
     with lock:
         if cache_key in folder_id_cache:
             return folder_id_cache[cache_key]
             
-    # Format folder as clean target identifier pattern: "Daredevil Season 03"
     folder_name = f"{tmdb_name.strip()} Season {int(season_num):02d}"
     print(f"[FOLDER SELECTION] Verifying/Creating remote storage structure: '{folder_name}'")
-    
     create_folder_url = f"https://api.vidara.so/v1/folder/create?api_key={API_KEY}&name={requests.utils.quote(folder_name)}"
     
     try:
@@ -171,7 +175,6 @@ def synchronize_cms_database(tmdb_id, season_num, episode_num, file_url, languag
     }
     
     try:
-        # STEP 1: IMPORT / VERIFY THE PARENT SERIES ENVELOPE
         print("[STEP 1] Running Master TMDB Import / Verification...")
         series_res = requests.post(
             f"{ADMIN_BASE_URL}/admin/import/series",
@@ -186,7 +189,6 @@ def synchronize_cms_database(tmdb_id, season_num, episode_num, file_url, languag
             series_res.raise_for_status()
             print("-> [SUCCESS] New series imported successfully.")
 
-        # STEP 2: RESOLVE THE INTERNAL DB SERIES ID & SEASON ID
         print(f"[STEP 2] Fetching internal layout mapping indices via TMDB ID...")
         seasons_res = requests.get(
             f"{ADMIN_BASE_URL}/series/{tmdb_id}/seasons",
@@ -215,7 +217,6 @@ def synchronize_cms_database(tmdb_id, season_num, episode_num, file_url, languag
 
         print(f"-> [SUCCESS] Series DB ID: [{internal_series_id}] | Season DB ID: [{internal_season_id}]")
 
-        # STEP 3: SYNC THE TARGET SEASON TRACK STRUCTURE
         print(f"[STEP 3] Synchronizing season tracks via Internal Series ID [{internal_series_id}]...")
         sync_res = requests.post(
             f"{ADMIN_BASE_URL}/admin/series/{internal_series_id}/sync-season/{int(season_num)}",
@@ -229,7 +230,6 @@ def synchronize_cms_database(tmdb_id, season_num, episode_num, file_url, languag
             sync_res.raise_for_status()
             print("-> [SUCCESS] Worker season-to-episode mapping synchronized.")
 
-        # STEP 4: RESOLVE THE INTERNAL EPISODE ID
         print(f"[STEP 4] Fetching current episode table list for Season ID [{internal_season_id}]...")
         episodes_res = requests.get(
             f"{ADMIN_BASE_URL}/seasons/{internal_season_id}/episodes",
@@ -252,7 +252,6 @@ def synchronize_cms_database(tmdb_id, season_num, episode_num, file_url, languag
 
         print(f"-> [SUCCESS] Target Episode localized. Internal Episode Table ID: {internal_episode_id}")
 
-        # STEP 5: ATTACH LINK USING PRE-STRINGIFIED ARRAY PATCH
         print(f"[STEP 5] Injecting stream content payload into Episode node: {internal_episode_id}...")
         link_payload = {
             "url": file_url,
@@ -305,16 +304,14 @@ def upload_processor_worker(worker_id):
         attempts, success = 0, False
         while attempts < 3:
             try:
-                # Prepare base API fields payload
                 payload_fields = {
                     "api_key": API_KEY, 
                     "file": (custom_name, open(file_path, "rb"), "video/mp4")
                 }
                 
-                # Dynamic targeting parameter integration mapping injection logic
                 if target_fld_id:
                     payload_fields["fld_id"] = str(target_fld_id)
-                    payload_fields["folder_id"] = str(target_fld_id)  # Dual parameter fallback routing strategy
+                    payload_fields["folder_id"] = str(target_fld_id)
                 
                 encoder = MultipartEncoder(fields=payload_fields)
                 monitor = MultipartEncoderMonitor(encoder)
@@ -355,7 +352,55 @@ for i in range(MAX_CONCURRENT_UPLOADS):
     threads.append(t)
 
 # ==============================================================================
-# PIPELINE INGESTION LOGIC Loop
+# TELEGRAM ASYNC DOWNLOAD EXECUTION WRAPPER
+# ==============================================================================
+def telegram_progress_callback(current, total):
+    percentage = (current / total) * 100
+    current_mb = current / (1024 * 1024)
+    total_mb = total / (1024 * 1024)
+    print(f"\r📥 Telegram Ingestion: {percentage:.1f}% | {current_mb:.1f}/{total_mb:.1f} MB", end="")
+
+async def process_telegram_download(message_id, destination_folder):
+    if not tg_client.is_connected():
+        await tg_client.connect()
+        
+    try:
+        # Pull specified file target message directly via message ID integer
+        msg = await tg_client.get_messages(TG_CHANNEL_ID, ids=int(message_id))
+        if not msg or not msg.media:
+            print(f"\n❌ [TG ERROR] Message ID {message_id} contains no structural media files.")
+            return None
+            
+        raw_name = getattr(msg.file, 'name', f"tg_episode_{message_id}.mkv")
+        target_path = os.path.join(destination_folder, raw_name)
+        
+        print(f"\n🛰️ Stream connected. Fetching Telegram item: {raw_name}")
+        await tg_client.download_media(msg, file=target_path, progress_callback=telegram_progress_callback)
+        print(f"\n✅ Telegram direct file extraction finished.")
+        return target_path
+    except Exception as e:
+        print(f"\n❌ Telegram communication pipeline fault: {e}")
+        return None
+
+# Wrapper to execute the async code securely inside the synchronous loop
+def run_tg_download(message_id, destination_folder):
+    try:
+        loop = asyncio.get_event_loop()
+    except RuntimeError:
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        
+    if loop.is_running():
+        # Running inside environment with active loop (like Jupyter/Colab)
+        task = loop.create_task(process_telegram_download(message_id, destination_folder))
+        while not task.done():
+            time.sleep(0.5)
+        return task.result()
+    else:
+        return loop.run_until_complete(process_telegram_download(message_id, destination_folder))
+
+# ==============================================================================
+# PIPELINE INGESTION LOGIC LOOP
 # ==============================================================================
 for idx, row in enumerate(all_rows):
     row_idx = idx + 2
@@ -397,7 +442,6 @@ for idx, row in enumerate(all_rows):
                 final_s = s_extracted if s_extracted is not None else int(season)
                 final_e = e_extracted if e_extracted is not None else 1
                 
-                # Dynamic isolated location configuration for current iterated item
                 active_folder_id = get_or_create_vidara_folder(tmdb_id, tmdb_name, final_s)
                 
                 langs = parse_media_languages(extracted_path)
@@ -435,8 +479,6 @@ for idx, row in enumerate(all_rows):
 
         if download_res.returncode == 0 and os.path.exists(local_target_path):
             final_s = int(season)
-            
-            # Resolve or extract relevant target storage destination directory mapping indices
             active_folder_id = get_or_create_vidara_folder(tmdb_id, tmdb_name, final_s)
             
             langs = parse_media_languages(local_target_path)
@@ -464,6 +506,41 @@ for idx, row in enumerate(all_rows):
         else:
             sheet.update_cell(row_idx, status_col, "Failed")
             sheet.update_cell(row_idx, error_col + 1, "Aria2 engine dropped input stream download pointer.")
+
+    elif link_type == "TELEGRAM":
+        # Process targeted message ID using the secure execution engine
+        local_target_path = run_tg_download(input_link, TEMP_FOLDER)
+
+        if local_target_path and os.path.exists(local_target_path):
+            final_s = int(season)
+            active_folder_id = get_or_create_vidara_folder(tmdb_id, tmdb_name, final_s)
+            
+            langs = parse_media_languages(local_target_path)
+            short_langs = [l[:3] for l in langs]
+            
+            renamed_filename = f"{tmdb_name} S{final_s:02d} E{int(episode):02d} {' '.join(short_langs)}{Path(local_target_path).suffix}"
+            final_moved_path = os.path.join(OUTPUT_FOLDER, renamed_filename)
+            shutil.move(local_target_path, final_moved_path)
+
+            upload_queue.put({
+                "path": final_moved_path, "row_idx": row_idx, "tmdb_id": tmdb_id,
+                "season": final_s, "episode": int(episode), "filename": renamed_filename, 
+                "langs": langs, "folder_id": active_folder_id
+            })
+            
+            upload_queue.join()
+            
+            links_pushed = uploaded_links_tracker.get(row_idx, [])
+            if links_pushed:
+                sheet.update_cell(row_idx, final_link_col, links_pushed[0])
+                sheet.update_cell(row_idx, status_col, "Done")
+                sheet.update_cell(row_idx, error_col + 1, "")
+            else:
+                sheet.update_cell(row_idx, status_col, "Failed")
+                sheet.update_cell(row_idx, error_col + 1, "Vidara upload failed for the processed Telegram asset.")
+        else:
+            sheet.update_cell(row_idx, status_col, "Failed")
+            sheet.update_cell(row_idx, error_col + 1, f"Telegram client failed tracking or pulling Message ID: {input_link}")
 
 # Clean up backgrounds
 for _ in range(MAX_CONCURRENT_UPLOADS):
