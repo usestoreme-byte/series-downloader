@@ -30,6 +30,10 @@ jobs:
         GOOGLE_SHEETS_JSON: ${{ secrets.GOOGLE_SHEETS_JSON }}
         VIDARA_API_KEY: ${{ secrets.VIDARA_API_KEY }}
         ADMIN_KEY: ${{ secrets.ADMIN_KEY }}
-        # Fallback logic to read the ID regardless of how it's stored in GitHub
         SPREADSHEET_ID: ${{ secrets.SPREADSHEET_ID || vars.SPREADSHEET_ID || '11VbSz90oR87pDAqxDY-Zyrg4NNM3LgPxKynjqlzIueM' }}
+        # --- NEW TELEGRAM CONFIGURATION ENV MAPPINGS ---
+        TG_API_ID: ${{ secrets.TG_API_ID }}
+        TG_API_HASH: ${{ secrets.TG_API_HASH }}
+        TG_CHANNEL_ID: ${{ secrets.TG_CHANNEL_ID }}
+        TG_SESSION_STRING: ${{ secrets.TG_SESSION_STRING }}
       run: python series_worker.py
