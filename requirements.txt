@@ -2,4 +2,6 @@ gspread
 google-auth
 pymediainfo
 requests
-requests_toolbelt
+requests-toolbelt
+telethon
+cryptg
