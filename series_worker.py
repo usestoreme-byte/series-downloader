@@ -68,6 +68,10 @@ upload_queue = queue.Queue()
 uploaded_links_tracker = {} # Maps row_idx -> list of generated final links
 lock = threading.Lock()
 
+# Global tracking directory cache to prevent redundant API queries per thread execution
+# Structure: {(tmdb_id, season_number): folder_id}
+folder_id_cache = {}
+
 # ==============================================================================
 # SPREADSHEET INGESTION & HEADER MAPPING
 # ==============================================================================
@@ -122,6 +126,38 @@ def fetch_active_upload_server():
         return "https://api.vidara.so/v1/upload/server"
 
 upload_server = fetch_active_upload_server()
+
+def get_or_create_vidara_folder(tmdb_id, tmdb_name, season_num):
+    """
+    Thread-safe directory checking mechanism that evaluates whether an active 
+    Vidara system remote target node folder reference ID exists, or creates one.
+    """
+    cache_key = (str(tmdb_id).strip(), int(season_num))
+    
+    with lock:
+        if cache_key in folder_id_cache:
+            return folder_id_cache[cache_key]
+            
+    # Format folder as clean target identifier pattern: "Daredevil Season 03"
+    folder_name = f"{tmdb_name.strip()} Season {int(season_num):02d}"
+    print(f"[FOLDER SELECTION] Verifying/Creating remote storage structure: '{folder_name}'")
+    
+    create_folder_url = f"https://api.vidara.so/v1/folder/create?api_key={API_KEY}&name={requests.utils.quote(folder_name)}"
+    
+    try:
+        res = requests.get(create_folder_url, timeout=30).json()
+        if res.get("status") == 200:
+            fld_id = res["result"]["folder_id"]
+            with lock:
+                folder_id_cache[cache_key] = fld_id
+            print(f"-> [SUCCESS] Target operational root directory allocated with unique ID: {fld_id}")
+            return fld_id
+        else:
+            print(f"-> [WARNING] Remote api failed generating folder structural indices, fallback to root context. Response: {res}")
+            return None
+    except Exception as err:
+        print(f"-> [WARNING] Network transaction fault occurred creating cloud storage mapping nodes: {err}")
+        return None
 
 def synchronize_cms_database(tmdb_id, season_num, episode_num, file_url, languages):
     print(f"\n======================================================================")
@@ -261,14 +297,26 @@ def upload_processor_worker(worker_id):
         episode_num = task["episode"]
         custom_name = task["filename"]
         languages = task["langs"]
+        target_fld_id = task.get("folder_id")
 
         with lock:
-            print(f"[UPLOADER-{worker_id}] Pushing target stream: {custom_name}")
+            print(f"[UPLOADER-{worker_id}] Pushing target stream: {custom_name} into Folder ID: {target_fld_id}")
 
         attempts, success = 0, False
         while attempts < 3:
             try:
-                encoder = MultipartEncoder(fields={"api_key": API_KEY, "file": (custom_name, open(file_path, "rb"), "video/mp4")})
+                # Prepare base API fields payload
+                payload_fields = {
+                    "api_key": API_KEY, 
+                    "file": (custom_name, open(file_path, "rb"), "video/mp4")
+                }
+                
+                # Dynamic targeting parameter integration mapping injection logic
+                if target_fld_id:
+                    payload_fields["fld_id"] = str(target_fld_id)
+                    payload_fields["folder_id"] = str(target_fld_id)  # Dual parameter fallback routing strategy
+                
+                encoder = MultipartEncoder(fields=payload_fields)
                 monitor = MultipartEncoderMonitor(encoder)
                 res = requests.post(upload_server, data=monitor, headers={"Content-Type": monitor.content_type}, timeout=None)
                 encoder.fields["file"][1].close()
@@ -349,14 +397,17 @@ for idx, row in enumerate(all_rows):
                 final_s = s_extracted if s_extracted is not None else int(season)
                 final_e = e_extracted if e_extracted is not None else 1
                 
+                # Dynamic isolated location configuration for current iterated item
+                active_folder_id = get_or_create_vidara_folder(tmdb_id, tmdb_name, final_s)
+                
                 langs = parse_media_languages(extracted_path)
                 short_langs = [l[:3] for l in langs]
-                # CHANGED: Added space between S and E tag arrays
                 renamed_filename = f"{tmdb_name} S{final_s:02d} E{final_e:02d} {' '.join(short_langs)}{Path(extracted_path).suffix}"
 
                 upload_queue.put({
                     "path": extracted_path, "row_idx": row_idx, "tmdb_id": tmdb_id,
-                    "season": final_s, "episode": final_e, "filename": renamed_filename, "langs": langs
+                    "season": final_s, "episode": final_e, "filename": renamed_filename, 
+                    "langs": langs, "folder_id": active_folder_id
                 })
 
         try: os.remove(target_zip_path)
@@ -383,17 +434,22 @@ for idx, row in enumerate(all_rows):
         local_target_path = os.path.join(TEMP_FOLDER, ext)
 
         if download_res.returncode == 0 and os.path.exists(local_target_path):
+            final_s = int(season)
+            
+            # Resolve or extract relevant target storage destination directory mapping indices
+            active_folder_id = get_or_create_vidara_folder(tmdb_id, tmdb_name, final_s)
+            
             langs = parse_media_languages(local_target_path)
             short_langs = [l[:3] for l in langs]
             
-            # CHANGED: Added space between S and E tag arrays
-            renamed_filename = f"{tmdb_name} S{int(season):02d} E{int(episode):02d} {' '.join(short_langs)}{Path(local_target_path).suffix}"
+            renamed_filename = f"{tmdb_name} S{final_s:02d} E{int(episode):02d} {' '.join(short_langs)}{Path(local_target_path).suffix}"
             final_moved_path = os.path.join(OUTPUT_FOLDER, renamed_filename)
             shutil.move(local_target_path, final_moved_path)
 
             upload_queue.put({
                 "path": final_moved_path, "row_idx": row_idx, "tmdb_id": tmdb_id,
-                "season": int(season), "episode": int(episode), "filename": renamed_filename, "langs": langs
+                "season": final_s, "episode": int(episode), "filename": renamed_filename, 
+                "langs": langs, "folder_id": active_folder_id
             })
             
             upload_queue.join()
