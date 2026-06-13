@@ -56,7 +56,7 @@ TG_SESSION_STRING = os.environ.get("TG_SESSION_STRING", "1BVtsOKIBuyd2azy_Bxc7Mj
 BASE_DIR = "./media_work"
 TEMP_FOLDER = f"{BASE_DIR}/temp_downloads"
 OUTPUT_FOLDER = f"{BASE_DIR}/processed"
-SHEET_INDEX = 1  # TARGETS SECOND TAB: Series_Pipeline
+SHEET_INDEX = 1  
 
 ADMIN_BASE_URL = "https://streamio-api.usestoreme.workers.dev"
 MAX_CONCURRENT_UPLOADS = 3
@@ -74,13 +74,10 @@ lang_map = {
 }
 
 upload_queue = queue.Queue()
-uploaded_links_tracker = {} # Maps row_idx -> list of generated final links
+uploaded_links_tracker = {} 
 lock = threading.Lock()
-
-# Global tracking directory cache to prevent redundant API queries per thread execution
 folder_id_cache = {}
 
-# Initialize Telethon Client Context
 tg_client = TelegramClient(StringSession(TG_SESSION_STRING), TG_API_ID, TG_API_HASH)
 
 # ==============================================================================
@@ -323,7 +320,6 @@ def upload_processor_worker(worker_id):
                     final_url = data.get("filecode") or data.get("url") or data.get("result", {}).get("url")
                     if final_url:
                         db_synced = synchronize_cms_database(tmdb_id, season_num, episode_num, final_url, languages)
-                        
                         if db_synced:
                             with lock:
                                 if row_idx not in uploaded_links_tracker:
@@ -344,7 +340,6 @@ def upload_processor_worker(worker_id):
             except Exception: pass
         upload_queue.task_done()
 
-# Start background uploader daemons
 threads = []
 for i in range(MAX_CONCURRENT_UPLOADS):
     t = threading.Thread(target=upload_processor_worker, args=(i+1,), daemon=True)
@@ -352,29 +347,24 @@ for i in range(MAX_CONCURRENT_UPLOADS):
     threads.append(t)
 
 # ==============================================================================
-# MAXIMUM SPEED PARALLEL TELEGRAM DOWNLOAD ENGINE (FAULT-TOLERANT)
+# PARALLEL TELEGRAM DOWNLOAD ENGINE WITH SMART LINK RESOLUTION
 # ==============================================================================
 def telegram_progress_callback(current, total):
     percentage = (current / total) * 100
     current_mb = current / (1024 * 1024)
     total_mb = total / (1024 * 1024)
-    print(f"\r⚡ BLAZING DOWNLOAD: {percentage:.1f}% | {current_mb:.1f}/{total_mb:.1f} MB", end="")
+    print(f"\r⚡ SPEED DOWNLOAD: {percentage:.1f}% | {current_mb:.1f}/{total_mb:.1f} MB", end="")
 
 async def download_parallel_part(client, input_location, offset, size):
-    """Downloads a single isolated slice part of the file block over a dedicated connection pool."""
     return await client.download_file(input_location, offset=offset, limit=size)
 
 async def fast_parallel_download(client, message, destination_path, concurrency=8):
-    """Splits the asset file context into concurrent parts to download them simultaneously."""
     file_size = message.file.size
-    part_size = 512 * 1024  # Optimal 512KB chunk alignment matrix configuration
-    
+    part_size = 512 * 1024  
     total_parts = (file_size + part_size - 1) // part_size
     input_location = message.media.document
     
-    print(f"🚀 Initializing Parallel Multi-Stream Engine ({concurrency} concurrent pipes)...")
-    
-    # Pre-allocate complete byte array directly into memory buffer context
+    print(f"🚀 Launching Parallel Engine ({concurrency} streams)...")
     file_bytes = bytearray(file_size)
     part_idx = 0
     current_downloaded = 0
@@ -382,77 +372,68 @@ async def fast_parallel_download(client, message, destination_path, concurrency=
     while part_idx < total_parts:
         tasks = []
         task_mappings = []
-        
         for _ in range(concurrency):
             if part_idx >= total_parts:
                 break
-                
             offset = part_idx * part_size
-            remaining_bytes = file_size - offset
-            current_part_size = min(part_size, remaining_bytes)
+            current_part_size = min(part_size, file_size - offset)
             
             task = asyncio.create_task(download_parallel_part(client, input_location, offset, current_part_size))
             tasks.append(task)
             task_mappings.append((offset, current_part_size))
             part_idx += 1
             
-        # Fire simultaneous parallel HTTP connection hooks via gather
         results = await asyncio.gather(*tasks)
-        
-        # Ingest binary streams straight into allocated pointers
         for chunk_data, (offset, chunk_len) in zip(results, task_mappings):
             file_bytes[offset:offset + chunk_len] = chunk_data
             current_downloaded += chunk_len
-            
         telegram_progress_callback(current_downloaded, file_size)
 
-    # Atomic write step flush directly to deployment space drive
     with open(destination_path, 'wb') as f:
         f.write(file_bytes)
-        
     return destination_path
 
-async def process_telegram_download(message_id, destination_folder):
+async def process_telegram_download(input_link, destination_folder):
+    """Resolves raw message IDs or absolute t.me links safely."""
     if not tg_client.is_connected():
         await tg_client.connect()
         
+    # Extract structural digits out of full t.me link structures if provided
+    target_msg_id = input_link
+    if "t.me/" in str(input_link):
+        url_parts = str(input_link).split('/')
+        target_msg_id = url_parts[-1].split('?')[0]
+
     max_retries = 5
     attempt = 0
     
     while attempt < max_retries:
         try:
-            msg = await tg_client.get_messages(TG_CHANNEL_ID, ids=int(message_id))
+            msg = await tg_client.get_messages(TG_CHANNEL_ID, ids=int(target_msg_id))
             if not msg or not msg.media:
-                print(f"\n❌ [TG ERROR] Message ID {message_id} contains no structural media files.")
+                print(f"\n❌ [TG ERROR] Target element {target_msg_id} holds no download context.")
                 return None
                 
-            raw_name = getattr(msg.file, 'name', f"tg_episode_{message_id}.mkv")
+            raw_name = getattr(msg.file, 'name', f"tg_episode_{target_msg_id}.mkv")
             target_path = os.path.join(destination_folder, raw_name)
             
-            print(f"\n🛰---- Stream connected. Fetching Telegram item: {raw_name} (Attempt {attempt+1}/{max_retries})")
-            
-            # Execute max speed parallel memory downloader
             await fast_parallel_download(tg_client, msg, target_path, concurrency=8)
-            
-            print(f"\n✅ Telegram direct high-speed file extraction finished.")
+            print(f"\n✅ Direct high-speed file extraction finished.")
             return target_path
 
-        except (asyncio.CancelledError, Exception) as e:
+        except Exception as e:
             attempt += 1
-            print(f"\n⚠️ [NET STALL/CANCELLED] Mid-download glitch handled: {e}")
+            print(f"\n⚠️ Mid-download pipeline glitch handled: {e}")
             if attempt < max_retries:
-                print(f"🔄 Hard resetting network session sockets in 6 seconds...")
-                await asyncio.sleep(6)
+                await asyncio.sleep(5)
                 try:
                     await tg_client.disconnect()
                     await tg_client.connect()
-                except Exception:
-                    pass
+                except Exception: pass
             else:
-                print(f"\n❌ Max download retries exhausted for Message ID: {message_id}")
                 return None
 
-def run_tg_download(message_id, destination_folder):
+def run_tg_download(input_link, destination_folder):
     try:
         loop = asyncio.get_event_loop()
     except RuntimeError:
@@ -460,12 +441,12 @@ def run_tg_download(message_id, destination_folder):
         asyncio.set_event_loop(loop)
         
     if loop.is_running():
-        task = loop.create_task(process_telegram_download(message_id, destination_folder))
+        task = loop.create_task(process_telegram_download(input_link, destination_folder))
         while not task.done():
             time.sleep(0.2)
         return task.result()
     else:
-        return loop.run_until_complete(process_telegram_download(message_id, destination_folder))
+        return loop.run_until_complete(process_telegram_download(input_link, destination_folder))
 
 # ==============================================================================
 # PIPELINE INGESTION LOGIC LOOP
@@ -488,7 +469,6 @@ for idx, row in enumerate(all_rows):
     if link_type == "ZIP":
         zip_filename = f"bundle_{row_idx}.zip"
         target_zip_path = os.path.join(TEMP_FOLDER, zip_filename)
-        
         cmd = ["aria2c", "-x", "16", "-s", "16", "-k", "1M", "--file-allocation=none", "-d", TEMP_FOLDER, "-o", zip_filename, input_link]
         download_res = subprocess.run(cmd)
 
@@ -499,17 +479,14 @@ for idx, row in enumerate(all_rows):
 
         with zipfile.ZipFile(target_zip_path, 'r') as archive:
             valid_targets = [f for f in archive.infolist() if f.filename.lower().endswith(VIDEO_EXTENSIONS) and not f.filename.split('/')[-1].startswith('.')]
-            
             for file_info in valid_targets:
                 while upload_queue.qsize() >= (MAX_CONCURRENT_UPLOADS * 2):
                     time.sleep(2)
 
                 extracted_path = archive.extract(file_info, OUTPUT_FOLDER)
                 s_extracted, e_extracted = get_episode_code(os.path.basename(extracted_path))
-                
                 final_s = s_extracted if s_extracted is not None else int(season)
                 final_e = e_extracted if e_extracted is not None else 1
-                
                 active_folder_id = get_or_create_vidara_folder(tmdb_id, tmdb_name, final_s)
                 
                 langs = parse_media_languages(extracted_path)
@@ -524,7 +501,6 @@ for idx, row in enumerate(all_rows):
 
         try: os.remove(target_zip_path)
         except Exception: pass
-
         upload_queue.join()
         
         links_pushed = uploaded_links_tracker.get(row_idx, [])
@@ -548,7 +524,6 @@ for idx, row in enumerate(all_rows):
         if download_res.returncode == 0 and os.path.exists(local_target_path):
             final_s = int(season)
             active_folder_id = get_or_create_vidara_folder(tmdb_id, tmdb_name, final_s)
-            
             langs = parse_media_languages(local_target_path)
             short_langs = [l[:3] for l in langs]
             
@@ -561,7 +536,6 @@ for idx, row in enumerate(all_rows):
                 "season": final_s, "episode": int(episode), "filename": renamed_filename, 
                 "langs": langs, "folder_id": active_folder_id
             })
-            
             upload_queue.join()
             
             links_pushed = uploaded_links_tracker.get(row_idx, [])
@@ -576,13 +550,11 @@ for idx, row in enumerate(all_rows):
             sheet.update_cell(row_idx, error_col + 1, "Aria2 engine dropped input stream download pointer.")
 
     elif link_type == "TELEGRAM":
-        # Process targeted message ID using the secure parallel engine
         local_target_path = run_tg_download(input_link, TEMP_FOLDER)
 
         if local_target_path and os.path.exists(local_target_path):
             final_s = int(season)
             active_folder_id = get_or_create_vidara_folder(tmdb_id, tmdb_name, final_s)
-            
             langs = parse_media_languages(local_target_path)
             short_langs = [l[:3] for l in langs]
             
@@ -595,7 +567,6 @@ for idx, row in enumerate(all_rows):
                 "season": final_s, "episode": int(episode), "filename": renamed_filename, 
                 "langs": langs, "folder_id": active_folder_id
             })
-            
             upload_queue.join()
             
             links_pushed = uploaded_links_tracker.get(row_idx, [])
@@ -608,7 +579,7 @@ for idx, row in enumerate(all_rows):
                 sheet.update_cell(row_idx, error_col + 1, "Vidara upload failed for the processed Telegram asset.")
         else:
             sheet.update_cell(row_idx, status_col, "Failed")
-            sheet.update_cell(row_idx, error_col + 1, f"Telegram client failed tracking or pulling Message ID: {input_link}")
+            sheet.update_cell(row_idx, error_col + 1, f"Telegram client failed tracking or pulling: {input_link}")
 
 # Clean up backgrounds
 for _ in range(MAX_CONCURRENT_UPLOADS):
