@@ -69,6 +69,7 @@ uploaded_links_tracker = {} # Maps row_idx -> list of generated final links
 lock = threading.Lock()
 
 # Global tracking directory cache to prevent redundant API queries per thread execution
+# Structure: {(tmdb_id, season_number): folder_id}
 folder_id_cache = {}
 
 # ==============================================================================
@@ -127,12 +128,17 @@ def fetch_active_upload_server():
 upload_server = fetch_active_upload_server()
 
 def get_or_create_vidara_folder(tmdb_id, tmdb_name, season_num):
+    """
+    Thread-safe directory checking mechanism that evaluates whether an active 
+    Vidara system remote target node folder reference ID exists, or creates one.
+    """
     cache_key = (str(tmdb_id).strip(), int(season_num))
     
     with lock:
         if cache_key in folder_id_cache:
             return folder_id_cache[cache_key]
             
+    # Format folder as clean target identifier pattern: "Daredevil Season 03"
     folder_name = f"{tmdb_name.strip()} Season {int(season_num):02d}"
     print(f"[FOLDER SELECTION] Verifying/Creating remote storage structure: '{folder_name}'")
     
@@ -152,33 +158,6 @@ def get_or_create_vidara_folder(tmdb_id, tmdb_name, season_num):
     except Exception as err:
         print(f"-> [WARNING] Network transaction fault occurred creating cloud storage mapping nodes: {err}")
         return None
-
-def move_file_to_vidara_folder(filecode, folder_id):
-    """
-    Leverages Vidara's file routing engine to reposition an isolated element
-    out of the root bucket and directly into its targeted system folder.
-    """
-    if not folder_id:
-        return False
-    try:
-        move_url = "https://api.vidara.so/v1/video/move"
-        params = {
-            "api_key": API_KEY,
-            "filecode": filecode,
-            "fld_id": str(folder_id)
-        }
-        res = requests.get(move_url, params=params, timeout=20).json()
-        if res.get("status") == 200 or res.get("msg") == "OK":
-            print(f"-> [ROUTING SUCCESS] Moved filecode {filecode} to Folder ID: {folder_id}")
-            return True
-        else:
-            # Fallback check if your specific cluster variant requires the alternative parameter label
-            params = {"api_key": API_KEY, "filecode": filecode, "folder_id": str(folder_id)}
-            res = requests.get(move_url, params=params, timeout=20).json()
-            return res.get("status") == 200 or res.get("msg") == "OK"
-    except Exception as e:
-        print(f"-> [ROUTING FAILED] Exception shifting file inside layout: {e}")
-        return False
 
 def synchronize_cms_database(tmdb_id, season_num, episode_num, file_url, languages):
     print(f"\n======================================================================")
@@ -326,12 +305,17 @@ def upload_processor_worker(worker_id):
         attempts, success = 0, False
         while attempts < 3:
             try:
-                # Match exact parameter names specified by Vidara upload documentation schema
+                # Prepare base API fields payload
                 payload_fields = {
                     "api_key": API_KEY, 
                     "file": (custom_name, open(file_path, "rb"), "video/mp4")
                 }
-
+                
+                # Dynamic targeting parameter integration mapping injection logic
+                if target_fld_id:
+                    payload_fields["fld_id"] = str(target_fld_id)
+                    payload_fields["folder_id"] = str(target_fld_id)  # Dual parameter fallback routing strategy
+                
                 encoder = MultipartEncoder(fields=payload_fields)
                 monitor = MultipartEncoderMonitor(encoder)
                 res = requests.post(upload_server, data=monitor, headers={"Content-Type": monitor.content_type}, timeout=None)
@@ -339,16 +323,8 @@ def upload_processor_worker(worker_id):
 
                 if res.status_code == 200:
                     data = res.json()
-                    
-                    # Extract the unique filecode structure
-                    f_code = data.get("filecode")
-                    final_url = data.get("url") or data.get("result", {}).get("url") or f"https://vidara.so/{f_code}"
-                    
+                    final_url = data.get("filecode") or data.get("url") or data.get("result", {}).get("url")
                     if final_url:
-                        # FIX: Execute post-upload file relocation route mapping sequence
-                        if f_code and target_fld_id:
-                            move_file_to_vidara_folder(f_code, target_fld_id)
-                            
                         db_synced = synchronize_cms_database(tmdb_id, season_num, episode_num, final_url, languages)
                         
                         if db_synced:
@@ -362,8 +338,7 @@ def upload_processor_worker(worker_id):
                 if "disk_full" in res.text:
                     upload_server = fetch_active_upload_server()
                 attempts += 1
-            except Exception as e:
-                print(f"[UPLOADER-ERROR] Thread Exception encountered: {e}")
+            except Exception:
                 attempts += 1
                 time.sleep(2)
 
@@ -422,6 +397,7 @@ for idx, row in enumerate(all_rows):
                 final_s = s_extracted if s_extracted is not None else int(season)
                 final_e = e_extracted if e_extracted is not None else 1
                 
+                # Dynamic isolated location configuration for current iterated item
                 active_folder_id = get_or_create_vidara_folder(tmdb_id, tmdb_name, final_s)
                 
                 langs = parse_media_languages(extracted_path)
@@ -460,6 +436,7 @@ for idx, row in enumerate(all_rows):
         if download_res.returncode == 0 and os.path.exists(local_target_path):
             final_s = int(season)
             
+            # Resolve or extract relevant target storage destination directory mapping indices
             active_folder_id = get_or_create_vidara_folder(tmdb_id, tmdb_name, final_s)
             
             langs = parse_media_languages(local_target_path)
