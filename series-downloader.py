@@ -79,6 +79,31 @@ LANG_MAP = {
     "or": "Oriya", "en": "English", "ja": "Japanese", "ko": "Korean", "es": "Spanish",
     "fr": "French", "de": "German", "ru": "Russian", "zh": "Chinese", "it": "Italian",
     "pt": "Portuguese", "ar": "Arabic", "tr": "Turkish",
+    # Extended ISO 639-2 codes (3-letter, used by MediaInfo for less common languages)
+    "aus": "Assamese", "tel": "Telugu", "hin": "Hindi", "tam": "Tamil", "mal": "Malayalam",
+    "kan": "Kannada", "ben": "Bengali", "pan": "Punjabi", "guj": "Gujarati", "mar": "Marathi",
+    "ori": "Oriya", "eng": "English", "jpn": "Japanese", "kor": "Korean", "spa": "Spanish",
+    "fra": "French", "deu": "German", "rus": "Russian", "zho": "Chinese", "ita": "Italian",
+    "por": "Portuguese", "ara": "Arabic", "tur": "Turkish",
+    "urd": "Urdu", "fas": "Persian", "tha": "Thai", "vie": "Vietnamese", "ind": "Indonesian",
+    "nld": "Dutch", "pol": "Polish", "swe": "Swedish", "nor": "Norwegian", "dan": "Danish",
+    "fin": "Finnish", "ces": "Czech", "hun": "Hungarian", "ron": "Romanian", "ukr": "Ukrainian",
+    "heb": "Hebrew", "cat": "Catalan", "ell": "Greek", "lav": "Latvian", "lit": "Lithuanian",
+    "slk": "Slovak", "slv": "Slovenian", "bul": "Bulgarian", "hrv": "Croatian", "srp": "Serbian",
+    "bos": "Bosnian", "mkd": "Macedonian", "sqi": "Albanian", "aze": "Azerbaijani",
+    "kaz": "Kazakh", "uzb": "Uzbek", "kir": "Kyrgyz", "tgk": "Tajik", "tuk": "Turkmen",
+    "mon": "Mongolian", "mya": "Burmese", "khm": "Khmer", "lao": "Lao", "sin": "Sinhala",
+    "nep": "Nepali", "bod": "Tibetan", "yue": "Cantonese", "nan": "Min Nan",
+    # Common 2-letter alternatives / variants
+    "in": "Indonesian", "ca": "Catalan", "el": "Greek", "cs": "Czech", "hu": "Hungarian",
+    "ro": "Romanian", "uk": "Ukrainian", "he": "Hebrew", "sv": "Swedish", "no": "Norwegian",
+    "da": "Danish", "fi": "Finnish", "pl": "Polish", "nl": "Dutch", "fa": "Persian",
+    "th": "Thai", "vi": "Vietnamese", "ur": "Urdu", "ne": "Nepali", "my": "Burmese",
+    "km": "Khmer", "lo": "Lao", "si": "Sinhala", "kk": "Kazakh", "uz": "Uzbek",
+    "az": "Azerbaijani", "mk": "Macedonian", "sq": "Albanian", "sk": "Slovak", "sl": "Slovenian",
+    "bg": "Bulgarian", "hr": "Croatian", "sr": "Serbian", "bs": "Bosnian",
+    # Special / fallbacks
+    "und": "English",  # undetermined → default to English
 }
 
 # ============================================================================
@@ -130,9 +155,9 @@ def get_episode_number(filename, fallback_ep=None):
     if not filename:
         return fallback_ep
     patterns = [
-        r'[Ss]\d{1,2}[Ee](\d{1,3})',         # S01E05
-        r'(\d{1,2})[xX]\d{1,3}',              # 1x05
-        r'[Ee][Pp]?(\d{1,3})',                # E05, EP05
+        r'[Ss]\d{1,2}\s*[Ee](\d{1,3})',     # S01E05, S01 E05
+        r'(\d{1,2})[xX]\d{1,3}',             # 1x05
+        r'[Ee][Pp]?(\d{1,3})',               # E05, EP05
         r'episode[\s._-]?(\d{1,3})',          # Episode 5
     ]
     for p in patterns:
@@ -145,7 +170,7 @@ def get_season_number(filename, fallback_season=None):
     """Extract season number from filename."""
     if not filename:
         return fallback_season
-    m = re.search(r'[Ss](\d{1,2})[Ee]\d{1,3}', filename)
+    m = re.search(r'[Ss](\d{1,2})\s*[Ee]\d{1,3}', filename)
     if m:
         return int(m.group(1))
     m = re.search(r'(\d{1,2})[xX]\d{1,3}', filename)
@@ -168,9 +193,9 @@ def parse_media_languages(file_path):
         return ["English"]
 
 def build_filename(series_name, season, episode, quality, languages):
-    """Build clean filename: Series S01E05 1080p Eng + Tel (no extension — Vidara works without it)"""
+    """Build clean filename: Series S01 E05 1080p Eng + Tel (no extension — Vidara works without it)"""
     short_langs = [l[:3] for l in languages]
-    return f"{series_name} S{int(season):02d}E{int(episode):02d} {quality} {' + '.join(short_langs)}"
+    return f"{series_name} S{int(season):02d} E{int(episode):02d} {quality} {' + '.join(short_langs)}"
 
 def fetch_vidara_upload_server():
     try:
