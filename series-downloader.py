@@ -181,15 +181,47 @@ def fetch_vidara_upload_server():
     except:
         return "https://api.vidara.so/v1/upload/server"
 
-def upload_to_vidara(file_path, custom_name):
-    """Upload file to Vidara, return filecode/URL."""
+# Folder cache (per tmdb_id + season)
+_folder_id_cache = {}
+
+def get_or_create_vidara_folder(tmdb_name, season_num):
+    """Create a Vidara folder for the season: 'Series Name Season 01'"""
+    cache_key = (tmdb_name.strip(), int(season_num))
+    if cache_key in _folder_id_cache:
+        return _folder_id_cache[cache_key]
+
+    folder_name = f"{tmdb_name.strip()} Season {int(season_num):02d}"
+    print(f"   [FOLDER] Creating: '{folder_name}'")
+    create_url = f"https://api.vidara.so/v1/folder/create?api_key={VIDARA_API_KEY}&name={requests.utils.quote(folder_name)}"
+
+    try:
+        res = requests.get(create_url, timeout=30).json()
+        if res.get("status") == 200:
+            fld_id = res["result"]["folder_id"]
+            _folder_id_cache[cache_key] = fld_id
+            print(f"   [FOLDER] Created — ID: {fld_id}")
+            return fld_id
+        else:
+            print(f"   [FOLDER] Warning: {res}")
+            return None
+    except Exception as e:
+        print(f"   [FOLDER] Error: {e}")
+        return None
+
+def upload_to_vidara(file_path, custom_name, folder_id=None):
+    """Upload file to Vidara, return filecode/URL. Optionally upload to a folder."""
     upload_server = fetch_vidara_upload_server()
     print(f"      Uploading: {custom_name} ({round(os.path.getsize(file_path) / 1048576, 1)} MB)")
 
-    encoder = MultipartEncoder(fields={
+    payload_fields = {
         "api_key": VIDARA_API_KEY,
         "file": (custom_name, open(file_path, "rb"), "video/mp4")
-    })
+    }
+    if folder_id:
+        payload_fields["fld_id"] = str(folder_id)
+        payload_fields["folder_id"] = str(folder_id)
+
+    encoder = MultipartEncoder(fields=payload_fields)
     monitor = MultipartEncoderMonitor(encoder)
     response = requests.post(upload_server, data=monitor, headers={"Content-Type": monitor.content_type}, timeout=None)
     encoder.fields["file"][1].close()
@@ -319,8 +351,11 @@ for idx, row in enumerate(all_rows):
                     shutil.move(extracted_path, final_path)
                     print(f"      Renamed: {clean_name}")
 
+                    # Create Vidara folder for this season (cached)
+                    folder_id = get_or_create_vidara_folder(tmdb_name, season_num)
+
                     # Upload
-                    vidara_url = upload_to_vidara(final_path, clean_name)
+                    vidara_url = upload_to_vidara(final_path, clean_name, folder_id)
                     print(f"      Vidara URL: {vidara_url}")
 
                     # Upsert to DB
@@ -367,8 +402,11 @@ for idx, row in enumerate(all_rows):
             shutil.move(temp_path, final_path)
             print(f"   Renamed: {clean_name}")
 
+            # Create Vidara folder for this season (cached)
+            folder_id = get_or_create_vidara_folder(tmdb_name, season_num)
+
             # Upload
-            vidara_url = upload_to_vidara(final_path, clean_name)
+            vidara_url = upload_to_vidara(final_path, clean_name, folder_id)
             print(f"   Vidara URL: {vidara_url}")
 
             # Upsert to DB
