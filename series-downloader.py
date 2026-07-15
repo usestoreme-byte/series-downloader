@@ -194,8 +194,11 @@ def parse_media_languages(file_path):
 
 def build_filename(series_name, season, episode, quality, languages):
     """Build clean filename: Series S01 E05 1080p Eng + Tel (no extension — Vidara works without it)"""
+    # Fix: Remove periods from the series name to prevent Vidara from truncating the filename at the first dot
+    clean_title = series_name.replace(".", "").strip()
+    
     short_langs = [l[:3] for l in languages]
-    return f"{series_name} S{int(season):02d} E{int(episode):02d} {quality} {' + '.join(short_langs)}"
+    return f"{clean_title} S{int(season):02d} E{int(episode):02d} {quality} {' + '.join(short_langs)}"
 
 def fetch_vidara_upload_server():
     try:
@@ -211,11 +214,13 @@ _folder_id_cache = {}
 
 def get_or_create_vidara_folder(tmdb_name, season_num):
     """Create a Vidara folder for the season: 'Series Name Season 01'"""
-    cache_key = (tmdb_name.strip(), int(season_num))
+    # Fix: Apply the dot-removal here too just in case folder generation is affected
+    clean_tmdb_name = tmdb_name.replace(".", "").strip()
+    cache_key = (clean_tmdb_name, int(season_num))
     if cache_key in _folder_id_cache:
         return _folder_id_cache[cache_key]
 
-    folder_name = f"{tmdb_name.strip()} Season {int(season_num):02d}"
+    folder_name = f"{clean_tmdb_name} Season {int(season_num):02d}"
     print(f"   [FOLDER] Creating: '{folder_name}'")
     create_url = f"https://api.vidara.so/v1/folder/create?api_key={VIDARA_API_KEY}&name={requests.utils.quote(folder_name)}"
 
