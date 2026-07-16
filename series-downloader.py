@@ -4,30 +4,6 @@ BEAM Series Downloader — GitHub Actions Pipeline
 =================================================
 Reads Google Sheet (Series_Pipeline tab) → downloads episodes → detects audio languages →
 renames files → uploads to Vidara → calls BEAM Worker upsert API → writes URLs back to sheet.
-
-Supports:
-  - SINGLE: one link = one episode (episode number from sheet or detected from filename)
-  - ZIP: download zip, extract, process each video file (episode number detected from filename)
-
-Sheet columns (Series_Pipeline tab):
-  A: TMDB_ID
-  B: TMDB_NAME
-  C: Season
-  D: Episode        (0 for ZIP = detect from filename inside zip)
-  E: Quality
-  F: Input_Link
-  G: Link_Type       (SINGLE or ZIP)
-  H: DOWNLOAD_STATUS (blank=pending, Done, Failed)
-  I: FINAL_LINK      (Vidara URL — for SINGLE: single URL, for ZIP: newline-separated URLs)
-  J: Error
-
-Setup:
-  GitHub Secrets needed:
-    GOOGLE_SHEETS_JSON  — service account JSON
-    SPREADSHEET_ID      — Google Sheet ID
-    VIDARA_API_KEY      — Vidara API key
-    BEAM_ADMIN_EMAIL    — beam-worker admin email
-    BEAM_ADMIN_PASSWORD — beam-worker admin password
 """
 
 import os
@@ -79,31 +55,11 @@ LANG_MAP = {
     "or": "Oriya", "en": "English", "ja": "Japanese", "ko": "Korean", "es": "Spanish",
     "fr": "French", "de": "German", "ru": "Russian", "zh": "Chinese", "it": "Italian",
     "pt": "Portuguese", "ar": "Arabic", "tr": "Turkish",
-    # Extended ISO 639-2 codes (3-letter, used by MediaInfo for less common languages)
     "aus": "Assamese", "tel": "Telugu", "hin": "Hindi", "tam": "Tamil", "mal": "Malayalam",
     "kan": "Kannada", "ben": "Bengali", "pan": "Punjabi", "guj": "Gujarati", "mar": "Marathi",
     "ori": "Oriya", "eng": "English", "jpn": "Japanese", "kor": "Korean", "spa": "Spanish",
     "fra": "French", "deu": "German", "rus": "Russian", "zho": "Chinese", "ita": "Italian",
-    "por": "Portuguese", "ara": "Arabic", "tur": "Turkish",
-    "urd": "Urdu", "fas": "Persian", "tha": "Thai", "vie": "Vietnamese", "ind": "Indonesian",
-    "nld": "Dutch", "pol": "Polish", "swe": "Swedish", "nor": "Norwegian", "dan": "Danish",
-    "fin": "Finnish", "ces": "Czech", "hun": "Hungarian", "ron": "Romanian", "ukr": "Ukrainian",
-    "heb": "Hebrew", "cat": "Catalan", "ell": "Greek", "lav": "Latvian", "lit": "Lithuanian",
-    "slk": "Slovak", "slv": "Slovenian", "bul": "Bulgarian", "hrv": "Croatian", "srp": "Serbian",
-    "bos": "Bosnian", "mkd": "Macedonian", "sqi": "Albanian", "aze": "Azerbaijani",
-    "kaz": "Kazakh", "uzb": "Uzbek", "kir": "Kyrgyz", "tgk": "Tajik", "tuk": "Turkmen",
-    "mon": "Mongolian", "mya": "Burmese", "khm": "Khmer", "lao": "Lao", "sin": "Sinhala",
-    "nep": "Nepali", "bod": "Tibetan", "yue": "Cantonese", "nan": "Min Nan",
-    # Common 2-letter alternatives / variants
-    "in": "Indonesian", "ca": "Catalan", "el": "Greek", "cs": "Czech", "hu": "Hungarian",
-    "ro": "Romanian", "uk": "Ukrainian", "he": "Hebrew", "sv": "Swedish", "no": "Norwegian",
-    "da": "Danish", "fi": "Finnish", "pl": "Polish", "nl": "Dutch", "fa": "Persian",
-    "th": "Thai", "vi": "Vietnamese", "ur": "Urdu", "ne": "Nepali", "my": "Burmese",
-    "km": "Khmer", "lo": "Lao", "si": "Sinhala", "kk": "Kazakh", "uz": "Uzbek",
-    "az": "Azerbaijani", "mk": "Macedonian", "sq": "Albanian", "sk": "Slovak", "sl": "Slovenian",
-    "bg": "Bulgarian", "hr": "Croatian", "sr": "Serbian", "bs": "Bosnian",
-    # Special / fallbacks
-    "und": "English",  # undetermined → default to English
+    "por": "Portuguese", "ara": "Arabic", "tur": "Turkish", "und": "English"
 }
 
 # ============================================================================
@@ -127,22 +83,19 @@ except Exception as auth_err:
 
 sheet = gc.open_by_key(SPREADSHEET_ID).get_worksheet(SHEET_INDEX)
 all_rows = sheet.get_all_records()
-headers = sheet.row_values(1)
-# Strip whitespace from headers
-headers = [h.strip() if isinstance(h, str) else h for h in headers]
+headers = [h.strip() if isinstance(h, str) else h for h in sheet.row_values(1)]
 
-# Column indices (1-based)
 try:
-    tmdb_id_col = headers.index("TMDB_ID") + 1         # A
-    tmdb_name_col = headers.index("TMDB_NAME") + 1     # B
-    season_col = headers.index("Season") + 1           # C
-    ep_col = headers.index("Episode") + 1              # D
-    quality_col = headers.index("Quality") + 1         # E
-    link_col = headers.index("Input_Link") + 1         # F
-    type_col = headers.index("Link_Type") + 1          # G
-    status_col = headers.index("DOWNLOAD_STATUS") + 1  # H
-    final_link_col = headers.index("FINAL_LINK") + 1   # I
-    error_col = headers.index("Error") + 1             # J
+    tmdb_id_col = headers.index("TMDB_ID") + 1
+    tmdb_name_col = headers.index("TMDB_NAME") + 1
+    season_col = headers.index("Season") + 1
+    ep_col = headers.index("Episode") + 1
+    quality_col = headers.index("Quality") + 1
+    link_col = headers.index("Input_Link") + 1
+    type_col = headers.index("Link_Type") + 1
+    status_col = headers.index("DOWNLOAD_STATUS") + 1
+    final_link_col = headers.index("FINAL_LINK") + 1
+    error_col = headers.index("Error") + 1
 except ValueError as e:
     raise Exception(f"Missing column header: {e}. Found headers: {headers}")
 
@@ -151,52 +104,49 @@ except ValueError as e:
 # ============================================================================
 
 def get_episode_number(filename, fallback_ep=None):
-    """Extract episode number from filename."""
-    if not filename:
-        return fallback_ep
-    patterns = [
-        r'[Ss]\d{1,2}\s*[Ee](\d{1,3})',     # S01E05, S01 E05
-        r'(\d{1,2})[xX]\d{1,3}',             # 1x05
-        r'[Ee][Pp]?(\d{1,3})',               # E05, EP05
-        r'episode[\s._-]?(\d{1,3})',          # Episode 5
-    ]
+    if not filename: return fallback_ep
+    patterns = [r'[Ss]\d{1,2}\s*[Ee](\d{1,3})', r'(\d{1,2})[xX]\d{1,3}', r'[Ee][Pp]?(\d{1,3})', r'episode[\s._-]?(\d{1,3})']
     for p in patterns:
         m = re.search(p, filename, re.IGNORECASE)
-        if m:
-            return int(m.group(1))
+        if m: return int(m.group(1))
     return fallback_ep
 
 def get_season_number(filename, fallback_season=None):
-    """Extract season number from filename."""
-    if not filename:
-        return fallback_season
+    if not filename: return fallback_season
     m = re.search(r'[Ss](\d{1,2})\s*[Ee]\d{1,3}', filename)
-    if m:
-        return int(m.group(1))
+    if m: return int(m.group(1))
     m = re.search(r'(\d{1,2})[xX]\d{1,3}', filename)
-    if m:
-        return int(m.group(1))
+    if m: return int(m.group(1))
     return fallback_season
 
 def parse_media_languages(file_path):
-    """Detect audio languages from file using MediaInfo."""
     try:
         media = MediaInfo.parse(str(file_path))
         langs = []
         for track in media.tracks:
             if track.track_type == "Audio":
                 code = track.language if track.language else "en"
-                mapped = LANG_MAP.get(code.lower(), "English")
-                langs.append(mapped)
+                langs.append(LANG_MAP.get(code.lower(), "English"))
         return list(dict.fromkeys(langs)) or ["English"]
     except Exception:
         return ["English"]
 
+def clean_string_for_vidara(text):
+    """Deep scrubs strings to avoid all filesystem, double-space, and API processing bugs."""
+    if not text:
+        return ""
+    # 1. Strip out dots completely
+    text = text.replace(".", "")
+    # 2. Replace slashes with a clean hyphen
+    text = text.replace("/", "-")
+    # 3. Strip out any remaining weird characters
+    text = re.sub(r'[:*?"<>|]', "", text)
+    # 4. Collapse any double or triple spaces into a single clean space
+    text = re.sub(r'\s+', ' ', text)
+    return text.strip()
+
 def build_filename(series_name, season, episode, quality, languages):
-    """Build clean filename: Series S01 E05 1080p Eng + Tel (no extension — Vidara works without it)"""
-    # Fix: Remove periods from the series name to prevent Vidara from truncating the filename at the first dot
-    clean_title = series_name.replace(".", "").strip()
-    
+    clean_title = clean_string_for_vidara(series_name)
     short_langs = [l[:3] for l in languages]
     return f"{clean_title} S{int(season):02d} E{int(episode):02d} {quality} {' + '.join(short_langs)}"
 
@@ -204,24 +154,20 @@ def fetch_vidara_upload_server():
     try:
         res = requests.get("https://api.vidara.so/v1/upload/server", params={"api_key": VIDARA_API_KEY}, timeout=30)
         res.raise_for_status()
-        data = res.json()
-        return data.get("result", {}).get("upload_server") or "https://api.vidara.so/v1/upload/server"
+        return res.json().get("result", {}).get("upload_server") or "https://api.vidara.so/v1/upload/server"
     except:
         return "https://api.vidara.so/v1/upload/server"
 
-# Folder cache (per tmdb_id + season)
 _folder_id_cache = {}
 
 def get_or_create_vidara_folder(tmdb_name, season_num):
-    """Create a Vidara folder for the season: 'Series Name Season 01'"""
-    # Fix: Apply the dot-removal here too just in case folder generation is affected
-    clean_tmdb_name = tmdb_name.replace(".", "").strip()
+    clean_tmdb_name = clean_string_for_vidara(tmdb_name)
     cache_key = (clean_tmdb_name, int(season_num))
     if cache_key in _folder_id_cache:
         return _folder_id_cache[cache_key]
 
     folder_name = f"{clean_tmdb_name} Season {int(season_num):02d}"
-    print(f"   [FOLDER] Creating: '{folder_name}'")
+    print(f"    [FOLDER] Creating: '{folder_name}'")
     create_url = f"https://api.vidara.so/v1/folder/create?api_key={VIDARA_API_KEY}&name={requests.utils.quote(folder_name)}"
 
     try:
@@ -229,17 +175,16 @@ def get_or_create_vidara_folder(tmdb_name, season_num):
         if res.get("status") == 200:
             fld_id = res["result"]["folder_id"]
             _folder_id_cache[cache_key] = fld_id
-            print(f"   [FOLDER] Created — ID: {fld_id}")
+            print(f"    [FOLDER] Created — ID: {fld_id}")
             return fld_id
         else:
-            print(f"   [FOLDER] Warning: {res}")
+            print(f"    [FOLDER] Warning: {res}")
             return None
     except Exception as e:
-        print(f"   [FOLDER] Error: {e}")
+        print(f"    [FOLDER] Error: {e}")
         return None
 
 def upload_to_vidara(file_path, custom_name, folder_id=None):
-    """Upload file to Vidara, return filecode/URL. Optionally upload to a folder."""
     upload_server = fetch_vidara_upload_server()
     print(f"      Uploading: {custom_name} ({round(os.path.getsize(file_path) / 1048576, 1)} MB)")
 
@@ -263,15 +208,11 @@ def upload_to_vidara(file_path, custom_name, folder_id=None):
         raise Exception(f"Vidara upload failed: {response.status_code}")
 
 def beam_login():
-    res = requests.post(f"{BEAM_WORKER_URL}/auth/login", json={
-        "email": ADMIN_EMAIL,
-        "password": ADMIN_PASSWORD
-    }, timeout=30)
+    res = requests.post(f"{BEAM_WORKER_URL}/auth/login", json={"email": ADMIN_EMAIL, "password": ADMIN_PASSWORD}, timeout=30)
     res.raise_for_status()
     return res.json()["token"]
 
 def beam_upsert(jwt, tmdb_id, season, episode, quality, languages, url):
-    """Call BEAM worker upsert endpoint for episodes."""
     res = requests.post(f"{BEAM_WORKER_URL}/admin/vidara/upsert", json={
         "content_type": "episode",
         "tmdb_id": int(tmdb_id),
@@ -285,27 +226,18 @@ def beam_upsert(jwt, tmdb_id, season, episode, quality, languages, url):
     return res.json()
 
 def download_file(url, dest_path):
-    """Download using aria2c, fallback to requests."""
-    cmd = [
-        "aria2c", "-x", "16", "-s", "16", "-k", "1M",
-        "--file-allocation=none", "--summary-interval=0",
-        "-d", os.path.dirname(dest_path), "-o", os.path.basename(dest_path), url
-    ]
+    cmd = ["aria2c", "-x", "16", "-s", "16", "-k", "1M", "--file-allocation=none", "--summary-interval=0", "-d", os.path.dirname(dest_path), "-o", os.path.basename(dest_path), url]
     result = subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True)
     if result.returncode == 0 and os.path.exists(dest_path) and os.path.getsize(dest_path) > 1024 * 1024:
         return True
 
-    print("   [WARN] aria2c failed, trying direct stream...")
     try:
-        if os.path.exists(dest_path):
-            os.remove(dest_path)
-        headers = {"User-Agent": "Mozilla/5.0"}
-        with requests.get(url, headers=headers, stream=True, timeout=60) as r:
+        if os.path.exists(dest_path): os.remove(dest_path)
+        with requests.get(url, headers={"User-Agent": "Mozilla/5.0"}, stream=True, timeout=60) as r:
             r.raise_for_status()
             with open(dest_path, 'wb') as f:
                 for chunk in r.iter_content(chunk_size=1024 * 1024):
-                    if chunk:
-                        f.write(chunk)
+                    if chunk: f.write(chunk)
         return os.path.exists(dest_path) and os.path.getsize(dest_path) > 1024 * 1024
     except Exception as e:
         print(f"   [ERROR] Download failed: {e}")
@@ -315,16 +247,11 @@ def download_file(url, dest_path):
 # MAIN PIPELINE
 # ============================================================================
 print(f"\nProcessing {len(all_rows)} rows from Series_Pipeline...\n")
-
 jwt = beam_login()
-print("[OK] Logged into BEAM worker\n")
 
 for idx, row in enumerate(all_rows):
     row_idx = idx + 2
-
-    # ONLY process rows where DOWNLOAD_STATUS is blank — skip Done, Failed, and any other value
-    status = str(row.get("DOWNLOAD_STATUS", "")).strip()
-    if status.strip() != "":
+    if str(row.get("DOWNLOAD_STATUS", "")).strip() != "":
         continue
 
     tmdb_id = str(row.get("TMDB_ID", "")).strip()
@@ -338,141 +265,73 @@ for idx, row in enumerate(all_rows):
     if not input_link or not tmdb_id or not quality:
         continue
 
-    print(f"\n{'='*60}")
-    print(f"Row {row_idx}: {tmdb_name} — S{season} — {quality} — {link_type}")
-    print(f"{'='*60}")
+    print(f"\n{'='*60}\nRow {row_idx}: {tmdb_name} — S{season} — {link_type}\n{'='*60}")
 
     try:
         if link_type == "ZIP":
-            # ── ZIP: download, extract, process each video file ──
-            print(f"   Downloading ZIP from: {input_link[:80]}...")
             zip_path = os.path.join(TEMP_FOLDER, f"bundle_{row_idx}.zip")
-            if not download_file(input_link, zip_path):
-                raise Exception("ZIP download failed")
-
-            if not zipfile.is_zipfile(zip_path):
-                raise Exception("Downloaded file is not a valid ZIP")
+            if not download_file(input_link, zip_path) or not zipfile.is_zipfile(zip_path):
+                raise Exception("Invalid ZIP download")
 
             with zipfile.ZipFile(zip_path, 'r') as archive:
-                video_files = [f for f in archive.infolist()
-                               if f.filename.lower().endswith(VIDEO_EXTENSIONS)
-                               and not os.path.basename(f.filename).startswith('.')]
-
-                print(f"   Found {len(video_files)} video files in ZIP")
+                video_files = [f for f in archive.infolist() if f.filename.lower().endswith(VIDEO_EXTENSIONS) and not os.path.basename(f.filename).startswith('.')]
                 all_urls = []
 
                 for vf in video_files:
-                    print(f"\n   Processing: {vf.filename}")
                     extracted_path = archive.extract(vf, OUTPUT_FOLDER)
-
-                    # Detect episode number from filename
-                    ep_num = get_episode_number(vf.filename)
-                    if not ep_num:
-                        ep_num = episode if episode else 1
+                    ep_num = get_episode_number(vf.filename, episode if episode else 1)
                     season_num = get_season_number(vf.filename, season)
-
-                    # Detect languages
                     languages = parse_media_languages(extracted_path)
-                    print(f"      Episode: S{season_num:02d}E{ep_num:02d}, Languages: {languages}")
 
-                    # Rename
                     clean_name = build_filename(tmdb_name, season_num, ep_num, quality, languages)
                     final_path = os.path.join(OUTPUT_FOLDER, clean_name)
                     shutil.move(extracted_path, final_path)
-                    print(f"      Renamed: {clean_name}")
 
-                    # Create Vidara folder for this season (cached)
                     folder_id = get_or_create_vidara_folder(tmdb_name, season_num)
-
-                    # Upload
                     vidara_url = upload_to_vidara(final_path, clean_name, folder_id)
-                    print(f"      Vidara URL: {vidara_url}")
-
-                    # Upsert to DB
-                    result = beam_upsert(jwt, tmdb_id, season_num, ep_num, quality, languages, vidara_url)
-                    print(f"      DB: {result.get('action')} (id: {result.get('id')})")
-
+                    beam_upsert(jwt, tmdb_id, season_num, ep_num, quality, languages, vidara_url)
                     all_urls.append(vidara_url)
 
-                    # Cleanup
-                    if os.path.exists(final_path):
-                        os.remove(final_path)
+                    if os.path.exists(final_path): os.remove(final_path)
 
-            # Write all URLs to sheet
             sheet.update_cell(row_idx, final_link_col, "\n".join(all_urls))
             sheet.update_cell(row_idx, status_col, "Done")
             sheet.update_cell(row_idx, error_col, "")
-
-            # Cleanup ZIP
-            if os.path.exists(zip_path):
-                os.remove(zip_path)
-
-            print(f"\n   ✅ {len(all_urls)} episodes processed")
+            if os.path.exists(zip_path): os.remove(zip_path)
 
         elif link_type == "SINGLE":
-            # ── SINGLE: one link = one episode ──
-            print(f"   Downloading from: {input_link[:80]}...")
             original_name = os.path.basename(input_link.split('?')[0]) or f"ep_{row_idx}.mkv"
             temp_path = os.path.join(TEMP_FOLDER, original_name)
 
             if not download_file(input_link, temp_path):
                 raise Exception("Download failed")
 
-            # Detect episode number
             ep_num = get_episode_number(original_name, episode if episode else 1)
             season_num = get_season_number(original_name, season)
-
-            # Detect languages
             languages = parse_media_languages(temp_path)
-            print(f"   Episode: S{season_num:02d}E{ep_num:02d}, Languages: {languages}")
 
-            # Rename
             clean_name = build_filename(tmdb_name, season_num, ep_num, quality, languages)
             final_path = os.path.join(OUTPUT_FOLDER, clean_name)
             shutil.move(temp_path, final_path)
-            print(f"   Renamed: {clean_name}")
 
-            # Create Vidara folder for this season (cached)
             folder_id = get_or_create_vidara_folder(tmdb_name, season_num)
-
-            # Upload
             vidara_url = upload_to_vidara(final_path, clean_name, folder_id)
-            print(f"   Vidara URL: {vidara_url}")
+            beam_upsert(jwt, tmdb_id, season_num, ep_num, quality, languages, vidara_url)
 
-            # Upsert to DB
-            result = beam_upsert(jwt, tmdb_id, season_num, ep_num, quality, languages, vidara_url)
-            print(f"   DB: {result.get('action')} (id: {result.get('id')})")
-
-            # Write to sheet
             sheet.update_cell(row_idx, final_link_col, vidara_url)
             sheet.update_cell(row_idx, status_col, "Done")
             sheet.update_cell(row_idx, error_col, "")
-
-            # Cleanup
-            if os.path.exists(final_path):
-                os.remove(final_path)
-
-        else:
-            sheet.update_cell(row_idx, status_col, "Failed")
-            sheet.update_cell(row_idx, error_col, f"Unknown Link_Type: {link_type}")
+            if os.path.exists(final_path): os.remove(final_path)
 
     except Exception as e:
         print(f"   [ERROR] {e}")
         sheet.update_cell(row_idx, status_col, "Failed")
         sheet.update_cell(row_idx, error_col, str(e)[:500])
-
-        # Cleanup any leftover temp files
         for p in [locals().get('temp_path'), locals().get('zip_path'), locals().get('final_path')]:
             if p and os.path.exists(p):
                 try: os.remove(p)
                 except: pass
 
-print(f"\n{'='*60}")
-print("SERIES PIPELINE COMPLETE")
-print(f"{'='*60}")
-
-# Cleanup
-try:
-    shutil.rmtree(BASE_DIR)
-except:
-    pass
+print(f"\n{'='*60}\nSERIES PIPELINE COMPLETE\n{'='*60}")
+try: shutil.rmtree(BASE_DIR)
+except: pass
