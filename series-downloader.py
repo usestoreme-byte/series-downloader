@@ -403,7 +403,7 @@ def process_episode_file(jwt, tmdb_id, series_name, season_num, episode_num,
 
         safe_delete(output_path)
         already_done_langs.add(lang)
-        print(f"         [OK] S{season_num:02d}E{episode_num:02d} {lang} uploaded.")
+        print(f"         [OK] S{int(season_num):02d}E{int(episode_num):02d} {lang} uploaded.")
 
 
 # ============================================================================
