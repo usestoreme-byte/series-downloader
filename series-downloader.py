@@ -505,9 +505,9 @@ def main():
     print("[OK] Connected to Google Sheets API")
 
     spreadsheet = gc.open_by_key(SPREADSHEET_ID)
-    master_sheet = spreadsheet.worksheet("Series_Master")
-    pipeline_sheet = spreadsheet.worksheet("Series_Pipeline")
-    archive_sheet = spreadsheet.worksheet("Series_Archive")
+    master_sheet = spreadsheet.worksheet("Master")
+    pipeline_sheet = spreadsheet.worksheet("Pipeline")
+    archive_sheet = spreadsheet.worksheet("Archive")
 
     jwt = beam_login()
     print("[OK] Logged into BEAM worker\n")
