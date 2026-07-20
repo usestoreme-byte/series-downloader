@@ -269,6 +269,31 @@ def get_or_create_vidara_folder(series_name, season_num, language):
         return None
 
 
+def extract_bare_filecode(data):
+    """
+    Vidara's upload response has been observed in two shapes:
+      1. {"filecode": "AbC123xY", "url": "https://vidara.so/v/AbC123xY", ...}  (documented)
+      2. {"url": "https://vidaraa.cc/e/AbC123xY", ...}  (no top-level filecode,
+         and a different embed domain — seen in practice)
+    The subtitle-attach API strictly needs the BARE code, not a full URL, so
+    always resolve down to just that final path segment.
+    """
+    candidate = (
+        data.get("filecode")
+        or data.get("result", {}).get("filecode")
+        or data.get("url")
+        or data.get("result", {}).get("url")
+    )
+    if not candidate:
+        raise Exception(f"Vidara upload returned no filecode/url: {data}")
+
+    # If it's a full URL (or anything with slashes), take the last segment.
+    if "/" in candidate:
+        candidate = candidate.rstrip("/").split("/")[-1]
+
+    return candidate
+
+
 def upload_to_vidara(file_path, custom_name, folder_id=None):
     upload_server = fetch_vidara_upload_server()
     print(f"      Uploading: {custom_name} ({round(os.path.getsize(file_path) / 1048576, 1)} MB)")
@@ -286,15 +311,7 @@ def upload_to_vidara(file_path, custom_name, folder_id=None):
 
     if response.status_code == 200:
         data = response.json()
-        filecode = (
-            data.get("filecode")
-            or data.get("url")
-            or data.get("result", {}).get("url")
-            or data.get("result", {}).get("filecode")
-        )
-        if not filecode:
-            raise Exception(f"Vidara upload returned no filecode/url: {data}")
-        return filecode
+        return extract_bare_filecode(data)
     else:
         raise Exception(f"Vidara upload failed: {response.status_code} {response.text[:200]}")
 
@@ -822,15 +839,28 @@ def main():
         master_sheet.delete_rows(i)
 
         pipeline_values_cleanup = pipeline_sheet.get_all_values()
+        kept_for_warnings = 0
         for j in range(len(pipeline_values_cleanup) - 1, 0, -1):
             prow = pipeline_values_cleanup[j]
             p_padded = prow + [""] * (len(pipeline_headers) - len(prow))
             p_tmdb = str(p_padded[pcol["TMDB_ID"] - 1]).strip()
             p_season = str(p_padded[pcol["Season"] - 1]).strip()
+            p_error = str(p_padded[pcol["Error"] - 1]).strip()
             if p_tmdb == tmdb_id and p_season == season:
+                if p_error:
+                    # Row is Done, but still has an unresolved note (e.g. a
+                    # subtitle that needs manual attaching). Keep it around
+                    # instead of silently discarding that info — it just
+                    # becomes a leftover reference row you can clear once
+                    # you've handled it.
+                    kept_for_warnings += 1
+                    continue
                 pipeline_sheet.delete_rows(j + 1)
 
-        print(f"[OK] Archived and cleaned up.")
+        if kept_for_warnings:
+            print(f"[OK] Archived. Kept {kept_for_warnings} Pipeline row(s) with unresolved warnings — check their Error column.")
+        else:
+            print(f"[OK] Archived and cleaned up.")
 
     try:
         shutil.rmtree(BASE_DIR, ignore_errors=True)
