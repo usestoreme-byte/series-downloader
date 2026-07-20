@@ -33,6 +33,7 @@ import shutil
 import requests
 import subprocess
 import zipfile
+import time
 from pathlib import Path
 import gspread
 from google.oauth2.service_account import Credentials
@@ -48,6 +49,16 @@ SCOPES = [
 ]
 
 VIDARA_API_KEY = os.environ.get("VIDARA_API_KEY", "").strip()
+
+# Internet Archive S3-style credentials, used to host extracted English
+# subtitles so Vidara can fetch them by direct URL.
+# SECURITY NOTE: hardcoded here only because you asked to test quickly —
+# swap these for a GitHub Secret (IA_ACCESS_KEY / IA_SECRET_KEY, same
+# pattern as VIDARA_API_KEY above) before running this long-term. Anyone
+# with read access to this file/repo gets full write access to your IA
+# account with these sitting here in plain text.
+IA_ACCESS_KEY = os.environ.get("IA_ACCESS_KEY", "EQ6XJ3AACbxfK4n7").strip()
+IA_SECRET_KEY = os.environ.get("IA_SECRET_KEY", "BlzN7vT0uJo7g3n2").strip()
 
 RAW_SPREADSHEET_ID = os.environ.get("SPREADSHEET_ID", "")
 SPREADSHEET_ID = RAW_SPREADSHEET_ID.replace("'", "").replace('"', '').strip()
@@ -317,14 +328,11 @@ def upload_to_vidara(file_path, custom_name, folder_id=None):
 
 
 # ============================================================================
-# SUBTITLES — extract English tracks only, host them for ~1 day on Litterbox,
-# then tell Vidara to attach that URL to the uploaded video's filecode.
+# SUBTITLES — extract English tracks only, host them permanently and freely
+# on Internet Archive, then tell Vidara to attach that URL to the uploaded video's filecode.
 # Extracting straight from the same source file we split the audio from
 # guarantees the subtitle timing matches — no separate re-sync possible.
 # ============================================================================
-
-LITTERBOX_API = "https://litterbox.catbox.moe/resources/internals/api.php"
-
 
 def extract_subtitle_to_srt(source_path, subtitle_stream_index, output_srt_path):
     """
@@ -347,24 +355,68 @@ def extract_subtitle_to_srt(source_path, subtitle_stream_index, output_srt_path)
     return True
 
 
-def upload_to_litterbox(file_path, expire="72h"):
+def slugify_for_ia(text, max_len=80):
     """
-    Free, no-signup temporary file host. Response body is a plain-text
-    direct URL. 72h gives a wide safety margin over the "at least a day"
-    requirement, and subtitle files are only a few KB so cost is negligible.
+    Internet Archive item/bucket identifiers and S3 keys only allow
+    alphanumerics, -, _, . — anything else gets collapsed to a dash.
     """
+    text = re.sub(r'[^a-zA-Z0-9\-_.]', '-', text or "")
+    text = re.sub(r'-+', '-', text).strip('-_.')
+    return (text.lower() or "item")[:max_len]
+
+
+def upload_to_archive_org(file_path, bucket_hint, key_hint, content_type="application/x-subrip", wait_seconds=60):
+    """
+    Uploads via Internet Archive's S3-compatible endpoint. `bucket_hint`
+    should be something stable per show+season so multiple subtitle files
+    land in the same IA "item" instead of creating a new one per file.
+    x-amz-auto-make-bucket creates that item automatically if it doesn't
+    exist yet. Storage is free and permanent — no expiry to manage.
+
+    IA can take anywhere from a few seconds to a couple minutes to make a
+    freshly uploaded file publicly fetchable, so this polls the direct
+    download URL briefly before handing it back — Vidara needs to fetch
+    it immediately, so handing back a URL that 404s yet would just move
+    the same failure mode over to a different host.
+    """
+    bucket = slugify_for_ia(f"beamplay-subs-{bucket_hint}")
+    key = slugify_for_ia(key_hint) + ".srt"
+    upload_url = f"https://s3.us.archive.org/{bucket}/{key}"
+
+    headers = {
+        "authorization": f"LOW {IA_ACCESS_KEY}:{IA_SECRET_KEY}",
+        "x-amz-auto-make-bucket": "1",
+        "x-archive-meta-mediatype": "texts",
+        "x-archive-meta-collection": "opensource",
+        "x-archive-ignore-preexisting-bucket": "1",
+        "Content-Type": content_type,
+    }
+
     with open(file_path, "rb") as fh:
-        response = requests.post(
-            LITTERBOX_API,
-            data={"reqtype": "fileupload", "time": expire},
-            files={"fileToUpload": fh},
-            timeout=30
-        )
-    response.raise_for_status()
-    url = response.text.strip()
-    if not url.startswith("http"):
-        raise Exception(f"Litterbox did not return a URL: {url[:200]}")
-    return url
+        data = fh.read()
+
+    response = requests.put(upload_url, data=data, headers=headers, timeout=60)
+    if response.status_code not in (200, 201):
+        raise Exception(f"Archive.org upload failed: {response.status_code} {response.text[:200]}")
+
+    direct_url = f"https://archive.org/download/{bucket}/{key}"
+
+    attempts = max(1, wait_seconds // 5)
+    for _ in range(attempts):
+        try:
+            check = requests.head(direct_url, timeout=10, allow_redirects=True)
+            if check.status_code == 200:
+                return direct_url
+        except Exception:
+            pass
+        time.sleep(5)
+
+    # Didn't confirm propagation within the wait window — hand the URL back
+    # anyway. Worst case Vidara's fetch fails once and this episode's
+    # subtitle becomes one of the "manual attach" warnings, same as any
+    # other subtitle-stage failure.
+    print(f"         [WARN] Archive.org file not confirmed reachable after {wait_seconds}s, proceeding anyway: {direct_url}")
+    return direct_url
 
 
 def attach_subtitle_to_vidara(filecode, sub_url, sub_lang="English"):
@@ -380,13 +432,14 @@ def attach_subtitle_to_vidara(filecode, sub_url, sub_lang="English"):
     return True
 
 
-def prepare_english_subtitle_urls(source_path, subtitle_tracks, tmp_prefix):
+def prepare_english_subtitle_urls(source_path, subtitle_tracks, bucket_hint, tmp_prefix):
     """
     Extracts every subtitle track normalized to 'English', uploads each to
-    Litterbox, and returns (urls, failure_reasons). Best-effort: a track
-    that fails to extract/upload is skipped (reason recorded) rather than
-    aborting the whole episode — the video itself matters more than a
-    caption attach.
+    Internet Archive (one IA "item" per bucket_hint, reused across every
+    subtitle for that show+season instead of creating a new item per file),
+    and returns (urls, failure_reasons). Best-effort: a track that fails to
+    extract/upload is skipped (reason recorded) rather than aborting the
+    whole episode — the video itself matters more than a caption attach.
     """
     urls = []
     failures = []
@@ -398,7 +451,7 @@ def prepare_english_subtitle_urls(source_path, subtitle_tracks, tmp_prefix):
         srt_path = os.path.join(TEMP_FOLDER, f"{tmp_prefix}_sub{idx}.srt")
         try:
             extract_subtitle_to_srt(source_path, sub["stream_index"], srt_path)
-            url = upload_to_litterbox(srt_path)
+            url = upload_to_archive_org(srt_path, bucket_hint, f"{tmp_prefix}_sub{idx}")
             urls.append(url)
             print(f"         [SUB] English subtitle #{idx+1} hosted -> {url}")
         except Exception as e:
@@ -491,7 +544,7 @@ def process_episode_file(jwt, tmdb_id, series_name, season_num, episode_num,
     uploaded for THIS episode within THIS row's scope. Raises on failure.
     `subtitle_warnings` is a list (mutated in place) of human-readable notes
     for any caption that didn't get attached — always includes the direct
-    Litterbox link when one was successfully generated, so it can be
+    Archive.org link when one was successfully generated, so it can be
     downloaded and attached to that filecode by hand.
     """
     audio_tracks, subtitle_tracks = inspect_tracks(source_path)
@@ -502,7 +555,7 @@ def process_episode_file(jwt, tmdb_id, series_name, season_num, episode_num,
     # same captions get attached to every audio-language video we upload
     # below, so there's no need to redo this per audio track.
     subtitle_urls, prep_failures = prepare_english_subtitle_urls(
-        source_path, subtitle_tracks, f"{tmdb_id}_S{season_num}E{episode_num}_{quality}"
+        source_path, subtitle_tracks, f"{tmdb_id}-s{season_num}", f"{tmdb_id}_S{season_num}E{episode_num}_{quality}"
     )
     for fail_reason in prep_failures:
         subtitle_warnings.append(
