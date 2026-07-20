@@ -299,6 +299,100 @@ def upload_to_vidara(file_path, custom_name, folder_id=None):
         raise Exception(f"Vidara upload failed: {response.status_code} {response.text[:200]}")
 
 
+# ============================================================================
+# SUBTITLES — extract English tracks only, host them for ~1 day on Litterbox,
+# then tell Vidara to attach that URL to the uploaded video's filecode.
+# Extracting straight from the same source file we split the audio from
+# guarantees the subtitle timing matches — no separate re-sync possible.
+# ============================================================================
+
+LITTERBOX_API = "https://litterbox.catbox.moe/resources/internals/api.php"
+
+
+def extract_subtitle_to_srt(source_path, subtitle_stream_index, output_srt_path):
+    """
+    Pulls ONE subtitle stream out of the source file as a standalone .srt.
+    Text-based subtitle codecs (srt/ass/webvtt/etc.) convert to srt cleanly
+    via -c:s srt. If a track is image-based (e.g. PGS/VobSub) ffmpeg can't
+    convert it to srt and this will fail — that's expected and handled by
+    the caller as a skip, not a hard error.
+    """
+    cmd = [
+        "ffmpeg", "-y",
+        "-i", str(source_path),
+        "-map", f"0:s:{subtitle_stream_index}",
+        "-c:s", "srt",
+        str(output_srt_path)
+    ]
+    result = subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True)
+    if result.returncode != 0 or not os.path.exists(output_srt_path) or os.path.getsize(output_srt_path) < 10:
+        raise Exception(f"ffmpeg subtitle extraction failed: {result.stderr[-300:] if result.stderr else 'unknown error'}")
+    return True
+
+
+def upload_to_litterbox(file_path, expire="72h"):
+    """
+    Free, no-signup temporary file host. Response body is a plain-text
+    direct URL. 72h gives a wide safety margin over the "at least a day"
+    requirement, and subtitle files are only a few KB so cost is negligible.
+    """
+    with open(file_path, "rb") as fh:
+        response = requests.post(
+            LITTERBOX_API,
+            data={"reqtype": "fileupload", "time": expire},
+            files={"fileToUpload": fh},
+            timeout=30
+        )
+    response.raise_for_status()
+    url = response.text.strip()
+    if not url.startswith("http"):
+        raise Exception(f"Litterbox did not return a URL: {url[:200]}")
+    return url
+
+
+def attach_subtitle_to_vidara(filecode, sub_url, sub_lang="English"):
+    res = requests.get(
+        "https://api.vidara.so/v1/upload/sub",
+        params={"api_key": VIDARA_API_KEY, "filecode": filecode, "sub_lang": sub_lang, "sub_url": sub_url},
+        timeout=30
+    )
+    res.raise_for_status()
+    data = res.json()
+    if data.get("status") != 200:
+        raise Exception(f"Vidara subtitle attach failed: {data}")
+    return True
+
+
+def prepare_english_subtitle_urls(source_path, subtitle_tracks, tmp_prefix):
+    """
+    Extracts every subtitle track normalized to 'English', uploads each to
+    Litterbox, and returns (urls, failure_reasons). Best-effort: a track
+    that fails to extract/upload is skipped (reason recorded) rather than
+    aborting the whole episode — the video itself matters more than a
+    caption attach.
+    """
+    urls = []
+    failures = []
+    english_tracks = [s for s in subtitle_tracks if s["language"] == "English"]
+    if not english_tracks:
+        return urls, failures
+
+    for idx, sub in enumerate(english_tracks):
+        srt_path = os.path.join(TEMP_FOLDER, f"{tmp_prefix}_sub{idx}.srt")
+        try:
+            extract_subtitle_to_srt(source_path, sub["stream_index"], srt_path)
+            url = upload_to_litterbox(srt_path)
+            urls.append(url)
+            print(f"         [SUB] English subtitle #{idx+1} hosted -> {url}")
+        except Exception as e:
+            failures.append(f"track #{idx+1}: {e}")
+            print(f"         [WARN] Could not prepare English subtitle #{idx+1}: {e}")
+        finally:
+            safe_delete(srt_path)
+
+    return urls, failures
+
+
 def beam_login():
     res = requests.post(f"{BEAM_WORKER_URL}/auth/login", json={
         "email": ADMIN_EMAIL,
@@ -374,14 +468,29 @@ def format_error(episode, language, stage, reason):
 # ============================================================================
 
 def process_episode_file(jwt, tmdb_id, series_name, season_num, episode_num,
-                          quality, source_path, already_done_langs):
+                          quality, source_path, already_done_langs, subtitle_warnings):
     """
     `already_done_langs` is a set (mutated in place) of languages already
     uploaded for THIS episode within THIS row's scope. Raises on failure.
+    `subtitle_warnings` is a list (mutated in place) of human-readable notes
+    for any caption that didn't get attached — always includes the direct
+    Litterbox link when one was successfully generated, so it can be
+    downloaded and attached to that filecode by hand.
     """
     audio_tracks, subtitle_tracks = inspect_tracks(source_path)
     print(f"         Audio: {[a['language'] for a in audio_tracks]}"
           + (f" | Subs: {[s['language'] for s in subtitle_tracks]}" if subtitle_tracks else ""))
+
+    # Extract + host every English subtitle track ONCE for this episode —
+    # same captions get attached to every audio-language video we upload
+    # below, so there's no need to redo this per audio track.
+    subtitle_urls, prep_failures = prepare_english_subtitle_urls(
+        source_path, subtitle_tracks, f"{tmdb_id}_S{season_num}E{episode_num}_{quality}"
+    )
+    for fail_reason in prep_failures:
+        subtitle_warnings.append(
+            f"S{season_num}E{episode_num} {quality}: could not extract/host English subtitle — {fail_reason}"
+        )
 
     for track in audio_tracks:
         lang = track["language"]
@@ -393,10 +502,10 @@ def process_episode_file(jwt, tmdb_id, series_name, season_num, episode_num,
         output_path = os.path.join(OUTPUT_FOLDER, output_name)
 
         try:
-            remux_single_audio(source_path, output_path, track, subtitle_tracks)
+            remux_single_audio(source_path, output_path, track, [])  # subs handled via API below, not embedded
             folder_id = get_or_create_vidara_folder(series_name, season_num, lang)
-            vidara_url = upload_to_vidara(output_path, output_name, folder_id)
-            beam_upsert(jwt, tmdb_id, season_num, episode_num, quality, lang, vidara_url)
+            filecode = upload_to_vidara(output_path, output_name, folder_id)
+            beam_upsert(jwt, tmdb_id, season_num, episode_num, quality, lang, filecode)
         except Exception as e:
             safe_delete(output_path)
             raise Exception(f"[E{episode_num} / {lang}] {e}")
@@ -404,6 +513,20 @@ def process_episode_file(jwt, tmdb_id, series_name, season_num, episode_num,
         safe_delete(output_path)
         already_done_langs.add(lang)
         print(f"         [OK] S{int(season_num):02d}E{int(episode_num):02d} {lang} uploaded.")
+
+        # Best-effort: attach every prepared English subtitle to this filecode.
+        for sub_url in subtitle_urls:
+            try:
+                attach_subtitle_to_vidara(filecode, sub_url, sub_lang="English")
+                print(f"         [SUB] Attached English caption to {filecode}")
+            except Exception as e:
+                warning = (
+                    f"S{season_num}E{episode_num} {quality} [{lang}] filecode {filecode}: "
+                    f"video uploaded OK but subtitle attach failed ({e}). "
+                    f"Download the caption yourself here: {sub_url}"
+                )
+                subtitle_warnings.append(warning)
+                print(f"         [WARN] {warning}")
 
 
 # ============================================================================
@@ -419,14 +542,15 @@ def process_single_row(jwt, tmdb_id, series_name, season, episode, quality, link
         safe_delete(temp_path)
         raise Exception(("Download", "Episode download failed after retries"))
 
+    subtitle_warnings = []
     try:
-        process_episode_file(jwt, tmdb_id, series_name, season, episode, quality, temp_path, set())
+        process_episode_file(jwt, tmdb_id, series_name, season, episode, quality, temp_path, set(), subtitle_warnings)
     except Exception as e:
         safe_delete(temp_path)
         raise Exception(("Split/Upload", str(e)))
 
     safe_delete(temp_path)
-    return 1  # one episode handled
+    return 1, subtitle_warnings  # one episode handled
 
 
 def process_zip_row(jwt, tmdb_id, series_name, season, quality, link):
@@ -448,6 +572,7 @@ def process_zip_row(jwt, tmdb_id, series_name, season, quality, link):
 
     episodes_done = 0
     processed = {}  # episode_num -> set(languages already uploaded, this zip only)
+    subtitle_warnings = []
 
     try:
         with zipfile.ZipFile(zip_path, 'r') as archive:
@@ -469,7 +594,7 @@ def process_zip_row(jwt, tmdb_id, series_name, season, quality, link):
                 done_langs = processed.setdefault(ep_num, set())
 
                 try:
-                    process_episode_file(jwt, tmdb_id, series_name, season, ep_num, quality, extract_target, done_langs)
+                    process_episode_file(jwt, tmdb_id, series_name, season, ep_num, quality, extract_target, done_langs, subtitle_warnings)
                 except Exception as e:
                     safe_delete(extract_target)
                     safe_delete(zip_path)
@@ -484,7 +609,7 @@ def process_zip_row(jwt, tmdb_id, series_name, season, quality, link):
         raise Exception(("ZIP Read", str(e)))
 
     safe_delete(zip_path)
-    return episodes_done
+    return episodes_done, subtitle_warnings
 
 
 # ============================================================================
@@ -602,13 +727,21 @@ def main():
 
         try:
             if link_type == "SINGLE":
-                process_single_row(jwt, tmdb_id, series_name, season, episode, quality, link)
+                _count, subtitle_warnings = process_single_row(jwt, tmdb_id, series_name, season, episode, quality, link)
             else:
-                process_zip_row(jwt, tmdb_id, series_name, season, quality, link)
+                _count, subtitle_warnings = process_zip_row(jwt, tmdb_id, series_name, season, quality, link)
 
             pipeline_sheet.update_cell(row_idx, pcol["DOWNLOAD_STATUS"], "Done")
-            pipeline_sheet.update_cell(row_idx, pcol["Error"], "")
-            print(f"    [DONE] Row {row_idx}")
+            if subtitle_warnings:
+                # Row still counts as Done (video uploaded fine) — Error just
+                # notes which captions need manual attaching, with the direct
+                # download link for each one.
+                note = "DONE — but some subtitles need manual attach:\n\n" + "\n\n".join(subtitle_warnings)
+                pipeline_sheet.update_cell(row_idx, pcol["Error"], note[:1500])
+                print(f"    [DONE with subtitle warnings] Row {row_idx}")
+            else:
+                pipeline_sheet.update_cell(row_idx, pcol["Error"], "")
+                print(f"    [DONE] Row {row_idx}")
 
         except Exception as e:
             stage, reason = e.args[0] if e.args and isinstance(e.args[0], tuple) else ("Unknown", str(e))
