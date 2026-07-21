@@ -280,29 +280,31 @@ def get_or_create_vidara_folder(series_name, season_num, language):
         return None
 
 
-def extract_bare_filecode(data):
+def extract_vidara_urls(data):
     """
-    Vidara's upload response has been observed in two shapes:
-      1. {"filecode": "AbC123xY", "url": "https://vidara.so/v/AbC123xY", ...}  (documented)
-      2. {"url": "https://vidaraa.cc/e/AbC123xY", ...}  (no top-level filecode,
-         and a different embed domain — seen in practice)
-    The subtitle-attach API strictly needs the BARE code, not a full URL, so
-    always resolve down to just that final path segment.
+    Returns (full_url, bare_filecode).
+
+    full_url: whatever URL Vidara actually returned in `url` (or
+    result.url), stored AS-IS into BEAM — Vidara's embed domain has changed
+    more than once (vidara.so -> vidaraa.cc -> vidara.to), so reconstructing
+    or hardcoding a domain is fragile. Store exactly what they give back.
+
+    bare_filecode: just the last path segment, needed ONLY internally for
+    the subtitle-attach API, which requires the bare code rather than a URL.
     """
-    candidate = (
-        data.get("filecode")
-        or data.get("result", {}).get("filecode")
-        or data.get("url")
-        or data.get("result", {}).get("url")
-    )
-    if not candidate:
-        raise Exception(f"Vidara upload returned no filecode/url: {data}")
+    full_url = data.get("url") or data.get("result", {}).get("url")
+    filecode = data.get("filecode") or data.get("result", {}).get("filecode")
 
-    # If it's a full URL (or anything with slashes), take the last segment.
-    if "/" in candidate:
-        candidate = candidate.rstrip("/").split("/")[-1]
+    if not full_url and not filecode:
+        raise Exception(f"Vidara upload returned no url/filecode: {data}")
 
-    return candidate
+    if not full_url:
+        full_url = filecode
+
+    if not filecode:
+        filecode = full_url.rstrip("/").split("/")[-1]
+
+    return full_url, filecode
 
 
 def upload_to_vidara(file_path, custom_name, folder_id=None):
@@ -322,7 +324,7 @@ def upload_to_vidara(file_path, custom_name, folder_id=None):
 
     if response.status_code == 200:
         data = response.json()
-        return extract_bare_filecode(data)
+        return extract_vidara_urls(data)  # (full_url, filecode)
     else:
         raise Exception(f"Vidara upload failed: {response.status_code} {response.text[:200]}")
 
@@ -432,6 +434,49 @@ def attach_subtitle_to_vidara(filecode, sub_url, sub_lang="English"):
     return True
 
 
+LITTERBOX_API = "https://litterbox.catbox.moe/resources/internals/api.php"
+
+
+def upload_to_litterbox(file_path, expire="72h"):
+    """
+    Fallback host used ONLY if Archive.org's upload throws (network error,
+    timeout, etc). Free, no-signup, temporary (72h is plenty for a subtitle
+    to get attached). Response body is a plain-text direct URL.
+    """
+    with open(file_path, "rb") as fh:
+        response = requests.post(
+            LITTERBOX_API,
+            data={"reqtype": "fileupload", "time": expire},
+            files={"fileToUpload": fh},
+            timeout=30
+        )
+    response.raise_for_status()
+    url = response.text.strip()
+    if not url.startswith("http"):
+        raise Exception(f"Litterbox did not return a URL: {url[:200]}")
+    return url
+
+
+def host_subtitle_with_fallback(srt_path, bucket_hint, key_hint):
+    """
+    Tries Archive.org first (permanent, free). If that throws for any
+    reason — network error, timeout, IA having a bad day — falls back to
+    Litterbox instead of failing the whole subtitle outright. Only if BOTH
+    fail does this raise, and the caller turns that into a clean warning
+    in the Error column.
+    """
+    try:
+        url = upload_to_archive_org(srt_path, bucket_hint, key_hint)
+        return url, "Archive.org"
+    except Exception as e_ia:
+        print(f"         [WARN] Archive.org upload failed ({e_ia}), falling back to Litterbox...")
+        try:
+            url = upload_to_litterbox(srt_path)
+            return url, "Litterbox"
+        except Exception as e_lb:
+            raise Exception(f"Archive.org failed ({e_ia}); Litterbox fallback also failed ({e_lb})")
+
+
 def prepare_english_subtitle_urls(source_path, subtitle_tracks, bucket_hint, tmp_prefix):
     """
     Extracts every subtitle track normalized to 'English', uploads each to
@@ -451,7 +496,7 @@ def prepare_english_subtitle_urls(source_path, subtitle_tracks, bucket_hint, tmp
         srt_path = os.path.join(TEMP_FOLDER, f"{tmp_prefix}_sub{idx}.srt")
         try:
             extract_subtitle_to_srt(source_path, sub["stream_index"], srt_path)
-            url = upload_to_archive_org(srt_path, bucket_hint, f"{tmp_prefix}_sub{idx}")
+            url, host = host_subtitle_with_fallback(srt_path, bucket_hint, f"{tmp_prefix}_sub{idx}")
             urls.append(url)
             print(f"         [SUB] English subtitle #{idx+1} hosted -> {url}")
         except Exception as e:
@@ -574,15 +619,15 @@ def process_episode_file(jwt, tmdb_id, series_name, season_num, episode_num,
         try:
             remux_single_audio(source_path, output_path, track, [])  # subs handled via API below, not embedded
             folder_id = get_or_create_vidara_folder(series_name, season_num, lang)
-            filecode = upload_to_vidara(output_path, output_name, folder_id)
-            beam_upsert(jwt, tmdb_id, season_num, episode_num, quality, lang, filecode)
+            video_url, filecode = upload_to_vidara(output_path, output_name, folder_id)
+            beam_upsert(jwt, tmdb_id, season_num, episode_num, quality, lang, video_url)
         except Exception as e:
             safe_delete(output_path)
             raise Exception(f"[E{episode_num} / {lang}] {e}")
 
         safe_delete(output_path)
         already_done_langs.add(lang)
-        print(f"         [OK] S{int(season_num):02d}E{int(episode_num):02d} {lang} uploaded.")
+        print(f"         [OK] S{int(season_num):02d}E{int(episode_num):02d} {lang} uploaded ({video_url}).")
 
         # Best-effort: attach every prepared English subtitle to this filecode.
         for sub_url in subtitle_urls:
@@ -591,7 +636,7 @@ def process_episode_file(jwt, tmdb_id, series_name, season_num, episode_num,
                 print(f"         [SUB] Attached English caption to {filecode}")
             except Exception as e:
                 warning = (
-                    f"S{season_num}E{episode_num} {quality} [{lang}] filecode {filecode}: "
+                    f"S{season_num}E{episode_num} {quality} [{lang}] video {video_url} (filecode {filecode}): "
                     f"video uploaded OK but subtitle attach failed ({e}). "
                     f"Download the caption yourself here: {sub_url}"
                 )
