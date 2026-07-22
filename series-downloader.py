@@ -247,30 +247,52 @@ def inspect_tracks(file_path):
 # FFMPEG — remux only, never re-encode
 # ============================================================================
 
-def remux_single_audio(source_path, output_path, audio_track, subtitle_tracks):
+def remux_single_audio(source_path, output_path, audio_track, subtitle_tracks, subtitle_srt_overrides=None):
     """
     Produces exactly one output file containing:
       - the original video stream
       - ONE specific audio stream (by its audio-only index)
       - all subtitle streams from this same source file (if any) - EMBEDDED
-    All streams are stream-copied (-c copy) -> no quality loss, no re-encoding.
+    All streams are stream-copied (-c copy) -> no quality loss, no re-encoding,
+    EXCEPT subtitle streams present in `subtitle_srt_overrides` (a dict of
+    subtitle stream_index -> path to a converted .srt file): those are read
+    from a second input (the OCR'd SRT) and encoded as real text `srt`
+    instead of copying the original bitmap (e.g. PGS/HDMV) stream. Later
+    -c:s options override earlier global ones for that specific stream,
+    so this is valid ffmpeg -map/-c syntax.
     """
+    subtitle_srt_overrides = subtitle_srt_overrides or {}
     audio_stream_index = audio_track["stream_index"]
     audio_iso3 = iso3_for_language(audio_track["language"])
 
-    cmd = [
-        "ffmpeg", "-y",
-        "-i", str(source_path),
-        "-map", "0:v:0",
-        "-map", f"0:a:{audio_stream_index}",
-    ]
+    cmd = ["ffmpeg", "-y", "-i", str(source_path)]
+
+    # Extra -i inputs for any OCR'd SRT overrides, in subtitle_tracks order.
+    override_input_idx = {}  # stream_index -> input index (1, 2, ...)
+    next_input = 1
     for sub in subtitle_tracks:
-        cmd += ["-map", f"0:s:{sub['stream_index']}"]
+        override_path = subtitle_srt_overrides.get(sub["stream_index"])
+        if override_path and os.path.exists(override_path):
+            cmd += ["-i", str(override_path)]
+            override_input_idx[sub["stream_index"]] = next_input
+            next_input += 1
+
+    cmd += ["-map", "0:v:0", "-map", f"0:a:{audio_stream_index}"]
+
+    for sub in subtitle_tracks:
+        if sub["stream_index"] in override_input_idx:
+            cmd += ["-map", f"{override_input_idx[sub['stream_index']]}:0"]
+        else:
+            cmd += ["-map", f"0:s:{sub['stream_index']}"]
 
     cmd += ["-c", "copy", "-map_chapters", "-1"]
     cmd += ["-metadata:s:a:0", f"language={audio_iso3}"]
     for out_idx, sub in enumerate(subtitle_tracks):
         sub_iso3 = iso3_for_language(sub["language"])
+        if sub["stream_index"] in override_input_idx:
+            # This stream comes from the OCR'd .srt input — encode as
+            # text subtitle rather than stream-copying the bitmap codec.
+            cmd += [f"-c:s:{out_idx}", "srt"]
         cmd += [f"-metadata:s:s:{out_idx}", f"language={sub_iso3}"]
 
     cmd.append(str(output_path))
@@ -437,6 +459,46 @@ def extract_subtitle_raw_copy(source_path, subtitle_stream_index, output_path):
     return True
 
 
+def ocr_sup_to_srt(sup_path, srt_path, timeout_seconds=600):
+    """
+    Converts an extracted PGS/HDMV bitmap subtitle (.sup) into a real,
+    readable .srt using `pgsrip` (which wraps mkvtoolnix + tesseract).
+    pgsrip works directly on a standalone .sup file and writes a sibling
+    .srt with the same basename, so we point it at a dedicated temp file
+    and then move/rename the result to `srt_path`.
+
+    Kept strictly sequential (one track at a time, never run in parallel
+    with other OCR jobs) — tesseract is CPU-heavy, so parallelizing this
+    on a shared CI runner just causes contention and slows everything
+    down rather than speeding it up. A timeout guards against a corrupt
+    or unusually large .sup file hanging the whole pipeline.
+
+    Returns True on success. Raises on failure (missing pgsrip, no
+    output produced, or timeout) so the caller can fall back to the raw
+    .sup copy instead of losing the track entirely.
+    """
+    sup_path = str(sup_path)
+    expected_srt = os.path.splitext(sup_path)[0] + ".srt"
+
+    cmd = ["pgsrip", sup_path]
+    try:
+        result = subprocess.run(
+            cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
+            text=True, timeout=timeout_seconds
+        )
+    except FileNotFoundError:
+        raise Exception("pgsrip is not installed/available on PATH")
+    except subprocess.TimeoutExpired:
+        raise Exception(f"pgsrip OCR timed out after {timeout_seconds}s")
+
+    if result.returncode != 0 or not os.path.exists(expected_srt) or os.path.getsize(expected_srt) < 10:
+        raise Exception(f"pgsrip OCR produced no usable output: {result.stderr[-300:] if result.stderr else 'unknown error'}")
+
+    if expected_srt != srt_path:
+        shutil.move(expected_srt, srt_path)
+    return True
+
+
 def slugify_for_ia(text, max_len=80):
     """
     Internet Archive item/bucket identifiers and S3 keys only allow
@@ -542,53 +604,87 @@ def host_subtitle_everywhere(sub_path, bucket_hint, key_hint, content_type="appl
 
 def prepare_english_subtitle_urls(source_path, subtitle_tracks, bucket_hint, tmp_prefix):
     """
-    Extracts every subtitle track normalized to 'English' and hosts each on
-    BOTH Archive.org and Litterbox, purely so we have shareable backup links
-    for the Error cell. (These same subtitle tracks are separately embedded
-    straight into the output video via remux_single_audio — this hosting
-    step is not required for playback, just for manual reference.)
+    Extracts every subtitle track normalized to 'English', converts it to a
+    real text .srt (running it through pgsrip OCR first if the source
+    codec is image-based like PGS/HDMV), and hosts each resulting .srt on
+    BOTH Archive.org and Litterbox for a shareable backup link. The exact
+    same .srt file is also handed back via `srt_overrides` so the caller
+    can embed the readable text subtitle into the video itself instead of
+    the original bitmap stream.
 
-    Returns (candidates, failure_reasons), where each candidate is
-    {"hosts": [(url, host_name), ...], "format": "srt" | "sup (...)"}.
-    A track only ends up in failure_reasons if BOTH hosts failed AND both
-    the srt conversion and the raw-copy fallback failed.
+    OCR is run strictly one track at a time (never in parallel) to avoid
+    piling up tesseract/mkvtoolnix processes on a shared CI runner.
+
+    Returns (candidates, failure_reasons, srt_overrides):
+      - candidates: [{"hosts": [(url, host_name), ...], "format": "srt" | "srt (OCR)"}]
+      - failure_reasons: ["track #N: reason", ...] — only when hosting AND
+        every conversion path (native srt, OCR, raw fallback) failed.
+      - srt_overrides: {subtitle_stream_index: path_to_srt_on_disk, ...} —
+        caller is responsible for deleting these paths when done (see
+        process_episode_file's `finally` cleanup).
     """
     candidates = []
     failures = []
+    srt_overrides = {}
     english_tracks = [s for s in subtitle_tracks if s["language"] == "English"]
     if not english_tracks:
-        return candidates, failures
+        return candidates, failures, srt_overrides
 
     for idx, sub in enumerate(english_tracks):
         srt_path = os.path.join(TEMP_FOLDER, f"{tmp_prefix}_sub{idx}.srt")
         sup_path = os.path.join(TEMP_FOLDER, f"{tmp_prefix}_sub{idx}.sup")
+        ocr_srt_path = os.path.join(TEMP_FOLDER, f"{tmp_prefix}_sub{idx}_ocr.srt")
+
         try:
+            # Fast path: source codec is already text-based (SRT/ASS/etc.)
             extract_subtitle_to_srt(source_path, sub["stream_index"], srt_path)
             hosted = host_subtitle_everywhere(srt_path, bucket_hint, f"{tmp_prefix}_sub{idx}")
             candidates.append({"hosts": hosted, "format": "srt"})
+            srt_overrides[sub["stream_index"]] = srt_path  # kept, not deleted here
             for url, host in hosted:
                 print(f"         [SUB] English subtitle #{idx+1} (srt) hosted via {host} -> {url}")
+            continue
         except Exception as srt_err:
+            safe_delete(srt_path)
             # Text conversion failed — most likely an image-based codec
-            # (PGS/HDMV, VobSub, etc). Fall back to a raw stream-copy
-            # instead of giving up.
+            # (PGS/HDMV, VobSub, etc). Pull the raw bitmap track out, then
+            # run it through OCR to get real text instead of just parking
+            # an unreadable .sup as the "backup".
+            pass
+
+        try:
+            extract_subtitle_raw_copy(source_path, sub["stream_index"], sup_path)
+        except Exception as raw_err:
+            failures.append(f"track #{idx+1}: could not extract subtitle stream at all — {raw_err}")
+            print(f"         [WARN] Could not extract English subtitle #{idx+1} in any form ({raw_err})")
+            continue
+
+        try:
+            ocr_sup_to_srt(sup_path, ocr_srt_path)
+            hosted = host_subtitle_everywhere(ocr_srt_path, bucket_hint, f"{tmp_prefix}_sub{idx}")
+            candidates.append({"hosts": hosted, "format": "srt (OCR)"})
+            srt_overrides[sub["stream_index"]] = ocr_srt_path  # kept, not deleted here
+            for url, host in hosted:
+                print(f"         [SUB] English subtitle #{idx+1} (OCR'd to srt) hosted via {host} -> {url}")
+        except Exception as ocr_err:
+            # OCR failed (pgsrip missing/timeout/etc) — fall back to
+            # hosting the raw .sup so there's still SOMETHING to work
+            # with manually, and note that OCR didn't happen.
+            print(f"         [WARN] PGS OCR failed for English subtitle #{idx+1} ({ocr_err}); falling back to raw .sup")
             try:
-                extract_subtitle_raw_copy(source_path, sub["stream_index"], sup_path)
                 hosted = host_subtitle_everywhere(
                     sup_path, bucket_hint, f"{tmp_prefix}_sub{idx}",
                     content_type="application/octet-stream", extension="sup"
                 )
-                candidates.append({"hosts": hosted, "format": "sup (image-based, needs OCR)"})
+                candidates.append({"hosts": hosted, "format": "sup (OCR failed, raw)"})
                 for url, host in hosted:
-                    print(f"         [SUB] English subtitle #{idx+1} (raw .sup, image-based) hosted via {host} -> {url}")
-            except Exception as raw_err:
-                failures.append(f"track #{idx+1}: {raw_err}")
-                print(f"         [WARN] Could not prepare English subtitle #{idx+1} as srt ({srt_err}) or raw copy ({raw_err})")
+                    print(f"         [SUB] English subtitle #{idx+1} (raw .sup, OCR failed) hosted via {host} -> {url}")
+            except Exception as raw_host_err:
+                failures.append(f"track #{idx+1}: OCR failed ({ocr_err}) and raw hosting failed ({raw_host_err})")
         finally:
-            safe_delete(srt_path)
             safe_delete(sup_path)
 
-    return candidates, failures
+    return candidates, failures, srt_overrides
 
 
 def beam_login():
@@ -600,18 +696,51 @@ def beam_login():
     return res.json()["token"]
 
 
-def beam_upsert(jwt, tmdb_id, season, episode, quality, language, url):
-    res = requests.post(f"{BEAM_WORKER_URL}/admin/vidara/upsert", json={
-        "content_type": "episode",
-        "tmdb_id": int(tmdb_id),
-        "season": int(season),
-        "episode": int(episode),
-        "url": url,
-        "quality": quality,
-        "audio_languages": [language]
-    }, headers={"Authorization": f"Bearer {jwt}"}, timeout=30)
-    res.raise_for_status()
-    return res.json()
+def beam_upsert(jwt, tmdb_id, season, episode, quality, language, url,
+                 max_attempts=5, base_delay=2):
+    """
+    Registers the uploaded episode with BEAM. The worker intermittently
+    throws transient 500s under load, so this retries with exponential
+    backoff (2s, 4s, 8s, 16s, 32s) on 5xx / network errors before giving
+    up. 4xx errors (bad request, auth, etc.) are not retried — those won't
+    fix themselves by waiting.
+
+    Raises only after all attempts are exhausted; the caller decides
+    whether that should be fatal (it no longer is — see
+    process_episode_file, which treats this as non-fatal since the video
+    is already uploaded and live regardless of DB registration).
+    """
+    last_err = None
+    for attempt in range(1, max_attempts + 1):
+        try:
+            res = requests.post(f"{BEAM_WORKER_URL}/admin/vidara/upsert", json={
+                "content_type": "episode",
+                "tmdb_id": int(tmdb_id),
+                "season": int(season),
+                "episode": int(episode),
+                "url": url,
+                "quality": quality,
+                "audio_languages": [language]
+            }, headers={"Authorization": f"Bearer {jwt}"}, timeout=30)
+
+            if res.status_code >= 500:
+                raise Exception(f"{res.status_code} Server Error: {res.text[:200]}")
+            res.raise_for_status()
+            return res.json()
+
+        except requests.exceptions.HTTPError as e:
+            # 4xx — won't fix itself by retrying.
+            raise Exception(f"BEAM upsert rejected (not retrying): {e}")
+
+        except Exception as e:
+            last_err = e
+            if attempt == max_attempts:
+                break
+            delay = base_delay * (2 ** (attempt - 1))
+            print(f"         [BEAM] upsert attempt {attempt}/{max_attempts} failed ({e}); retrying in {delay}s...")
+            time.sleep(delay)
+
+    raise Exception(f"BEAM upsert failed after {max_attempts} attempts: {last_err}")
 
 
 def download_file(url, dest_path):
@@ -668,16 +797,21 @@ def safe_delete(path):
         print(f"      [WARN] Could not delete {path}: {e}")
 
 
+# Google Sheets' real per-cell character limit is 50,000. The old 1500
+# limit was truncating episode/subtitle links mid-URL. Keep a small
+# safety margin under the real ceiling rather than the old cap.
+SHEET_CELL_CHAR_LIMIT = 49000
+
+
 def format_error(episode, language, stage, reason):
-    ep_line = f"Episode:\n{episode}\n\n" if episode is not None else ""
-    lang_line = f"Language:\n{language}\n\n" if language else ""
-    return (
-        f"FAILED\n\n"
-        f"{ep_line}"
-        f"{lang_line}"
-        f"Stage:\n{stage}\n\n"
-        f"Reason:\n{reason}"
-    )[:1500]
+    """
+    Compact single-line format so multiple episodes' worth of notes/links
+    can share a cell without one bulky entry eating the whole 50k budget.
+    e.g. "E7 [English] FAILED @ Split/Upload: 500 Server Error ..."
+    """
+    ep_part = f"E{episode} " if episode is not None else ""
+    lang_part = f"[{language}] " if language else ""
+    return f"{ep_part}{lang_part}FAILED @ {stage}: {reason}"[:SHEET_CELL_CHAR_LIMIT]
 
 
 # ============================================================================
@@ -700,48 +834,75 @@ def process_episode_file(jwt, tmdb_id, series_name, season_num, episode_num,
           + (f" | Subs: {[s['language'] for s in subtitle_tracks]}" if subtitle_tracks else ""))
 
     # Host every English subtitle track from this episode as backup copies
-    # (Archive.org + Litterbox). These are NOT sent to any attach API —
-    # the links are only recorded for manual/reference use. The actual
-    # delivery of subtitles happens via direct embedding below.
-    subtitle_candidates, prep_failures = prepare_english_subtitle_urls(
+    # (Archive.org + Litterbox), converting image-based (PGS/HDMV) tracks
+    # to real text SRT via OCR first. `subtitle_srt_overrides` maps
+    # subtitle stream_index -> path of a converted .srt file, so the remux
+    # step below can embed the readable SRT instead of the original
+    # bitmap subtitle for those specific streams. Compact per-episode
+    # note format keeps the Error/notes cell from being flooded with text
+    # and having links truncated.
+    subtitle_candidates, prep_failures, subtitle_srt_overrides = prepare_english_subtitle_urls(
         source_path, subtitle_tracks, f"{tmdb_id}-s{season_num}", f"{tmdb_id}_S{season_num}E{episode_num}_{quality}"
     )
-    if subtitle_candidates:
-        for cand_idx, candidate in enumerate(subtitle_candidates, start=1):
-            links_str = " | ".join(f"{host}: {url}" for url, host in candidate["hosts"])
-            fmt = candidate.get("format", "srt")
-            subtitle_notes.append(
-                f"S{season_num}E{episode_num} {quality}: English subtitle #{cand_idx} backup [{fmt}] — {links_str}"
-            )
-    for fail_reason in prep_failures:
-        subtitle_notes.append(
-            f"S{season_num}E{episode_num} {quality}: could not extract/host English subtitle — {fail_reason}"
-        )
+    try:
+        if subtitle_candidates:
+            links_all = []
+            for candidate in subtitle_candidates:
+                links_all.extend(url for url, _host in candidate["hosts"])
+            if links_all:
+                subtitle_notes.append(f"E{episode_num}: " + " | ".join(links_all))
+        for fail_reason in prep_failures:
+            subtitle_notes.append(f"E{episode_num}: subtitle prep failed — {fail_reason}")
 
-    for track in audio_tracks:
-        lang = track["language"]
-        if lang in already_done_langs:
-            print(f"         Skipping duplicate language for E{episode_num}: {lang}")
-            continue
+        for track in audio_tracks:
+            lang = track["language"]
+            if lang in already_done_langs:
+                print(f"         Skipping duplicate language for E{episode_num}: {lang}")
+                continue
 
-        output_name = build_filename(series_name, season_num, episode_num, quality, lang)
-        output_path = os.path.join(OUTPUT_FOLDER, output_name)
+            output_name = build_filename(series_name, season_num, episode_num, quality, lang)
+            output_path = os.path.join(OUTPUT_FOLDER, output_name)
 
-        try:
-            # Embed ALL subtitle tracks from this same source file directly
-            # into the output (stream-copy, no re-encode). This is the
-            # actual delivery mechanism for captions now.
-            remux_single_audio(source_path, output_path, track, subtitle_tracks)
-            folder_id = get_or_create_vidara_folder(series_name, season_num, quality, lang)
-            video_url, filecode = upload_to_vidara(output_path, output_name, folder_id)
-            beam_upsert(jwt, tmdb_id, season_num, episode_num, quality, lang, video_url)
-        except Exception as e:
+            try:
+                # Embed ALL subtitle tracks from this same source file
+                # directly into the output (stream-copy, no re-encode).
+                # This is the actual delivery mechanism for captions now.
+                # Any OCR'd (PGS -> SRT) tracks get swapped in here
+                # instead of the raw bitmap stream.
+                remux_single_audio(source_path, output_path, track, subtitle_tracks, subtitle_srt_overrides)
+                folder_id = get_or_create_vidara_folder(series_name, season_num, quality, lang)
+                video_url, filecode = upload_to_vidara(output_path, output_name, folder_id)
+            except Exception as e:
+                # Fatal: the video itself never made it up. Nothing to
+                # register with BEAM, nothing to keep on disk.
+                safe_delete(output_path)
+                raise Exception(f"[E{episode_num} / {lang}] {e}")
+
+            # The video is uploaded and live on Vidara at this point —
+            # that's the part that matters. BEAM registration (the
+            # metadata/DB sync) is handled separately and is NOT allowed
+            # to roll back or delete the already-uploaded video. If it
+            # fails even after retries, we just log a note so it can be
+            # registered manually later; we don't abort the rest of the
+            # episode/row over it.
+            try:
+                beam_upsert(jwt, tmdb_id, season_num, episode_num, quality, lang, video_url)
+            except Exception as beam_err:
+                subtitle_notes.append(
+                    f"E{episode_num} {lang}: live ({video_url}) DB-pending — {beam_err}"
+                )
+                print(f"         [WARN] BEAM registration failed for E{episode_num} {lang}, "
+                      f"video stays live: {beam_err}")
+
             safe_delete(output_path)
-            raise Exception(f"[E{episode_num} / {lang}] {e}")
-
-        safe_delete(output_path)
-        already_done_langs.add(lang)
-        print(f"         [OK] S{int(season_num):02d}E{int(episode_num):02d} {lang} uploaded (with embedded subtitles) ({video_url}).")
+            already_done_langs.add(lang)
+            print(f"         [OK] S{int(season_num):02d}E{int(episode_num):02d} {lang} uploaded (with embedded subtitles) ({video_url}).")
+    finally:
+        # Clean up any temporary OCR'd .srt files now that both the
+        # hosting step and every per-language remux/embed has finished
+        # with them.
+        for _idx, override_path in (subtitle_srt_overrides or {}).items():
+            safe_delete(override_path)
 
 
 # ============================================================================
@@ -948,12 +1109,15 @@ def main():
 
             pipeline_sheet.update_cell(row_idx, pcol["DOWNLOAD_STATUS"], "Done")
             if subtitle_notes:
-                # Row is Done either way (subtitles are embedded). This
-                # note is just the backup Archive.org/Litterbox links for
-                # the extracted English subtitles.
-                note = "DONE — subtitle backup links:\n\n" + "\n\n".join(subtitle_notes)
-                pipeline_sheet.update_cell(row_idx, pcol["Error"], note[:1500])
-                print(f"    [DONE with subtitle backup links] Row {row_idx}")
+                # Row is Done either way (subtitles are embedded). These
+                # notes are just the backup Archive.org/Litterbox links
+                # (compact "E<n>: url | url" per episode) plus any
+                # DB-registration warnings, one per line — no filler text,
+                # so far more episodes/links fit before hitting the cell
+                # character limit.
+                note = "\n".join(subtitle_notes)
+                pipeline_sheet.update_cell(row_idx, pcol["Error"], note[:SHEET_CELL_CHAR_LIMIT])
+                print(f"    [DONE with notes] Row {row_idx}")
             else:
                 pipeline_sheet.update_cell(row_idx, pcol["Error"], "")
                 print(f"    [DONE] Row {row_idx}")
