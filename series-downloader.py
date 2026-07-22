@@ -24,6 +24,15 @@ Sheet writes are checkpoint-based:
     after the run -> Master's DOWNLOAD_STATUS_xxxx recomputed from ALL
                       matching Pipeline rows (not just ones touched this run)
 No per-language sheet writes.
+
+Subtitles are EMBEDDED directly into each output video (stream-copy, same
+source file, no re-encode) — this is the actual delivery path. Vidara's
+subtitle-attach API is not used (it was unreliable). English subtitle
+tracks are also hosted on Archive.org + Litterbox purely as backup/manual
+links, dropped into the Pipeline row's Error cell for reference.
+
+Vidara folders are per (series, season, quality, language), e.g.
+"Breaking Bad Season 1 1080p English" / "Breaking Bad Season 1 720p Hindi".
 """
 
 import os
@@ -51,7 +60,7 @@ SCOPES = [
 VIDARA_API_KEY = os.environ.get("VIDARA_API_KEY", "").strip()
 
 # Internet Archive S3-style credentials, used to host extracted English
-# subtitles so Vidara can fetch them by direct URL.
+# subtitles so they have a shareable backup URL.
 # SECURITY NOTE: hardcoded here only because you asked to test quickly —
 # swap these for a GitHub Secret (IA_ACCESS_KEY / IA_SECRET_KEY, same
 # pattern as VIDARA_API_KEY above) before running this long-term. Anyone
@@ -76,12 +85,35 @@ VIDEO_EXTENSIONS = (".mp4", ".mkv", ".mov", ".avi", ".webm", ".flv")
 for p in [TEMP_FOLDER, OUTPUT_FOLDER]:
     os.makedirs(p, exist_ok=True)
 
+# Comprehensive ISO 639-1 language list (name + ISO 639-2/B code) so audio
+# tracks in less-common languages (Indonesian, Thai, Hebrew, etc.) get
+# properly identified instead of falling through to "Unknown".
 LANG_MAP = {
     "as": "Assamese", "te": "Telugu", "hi": "Hindi", "ta": "Tamil", "ml": "Malayalam",
     "kn": "Kannada", "bn": "Bengali", "pa": "Punjabi", "gu": "Gujarati", "mr": "Marathi",
     "or": "Oriya", "en": "English", "ja": "Japanese", "ko": "Korean", "es": "Spanish",
     "fr": "French", "de": "German", "ru": "Russian", "zh": "Chinese", "it": "Italian",
     "pt": "Portuguese", "ar": "Arabic", "tr": "Turkish",
+    "id": "Indonesian", "ms": "Malay", "th": "Thai", "vi": "Vietnamese", "tl": "Filipino",
+    "he": "Hebrew", "fa": "Persian", "ur": "Urdu", "ne": "Nepali", "si": "Sinhala",
+    "my": "Burmese", "km": "Khmer", "lo": "Lao", "mn": "Mongolian",
+    "nl": "Dutch", "sv": "Swedish", "no": "Norwegian", "da": "Danish", "fi": "Finnish",
+    "pl": "Polish", "cs": "Czech", "sk": "Slovak", "hu": "Hungarian", "ro": "Romanian",
+    "el": "Greek", "uk": "Ukrainian", "bg": "Bulgarian", "hr": "Croatian", "sr": "Serbian",
+    "sl": "Slovenian", "bs": "Bosnian", "mk": "Macedonian", "sq": "Albanian",
+    "lt": "Lithuanian", "lv": "Latvian", "et": "Estonian", "is": "Icelandic",
+    "ga": "Irish", "cy": "Welsh", "eu": "Basque", "ca": "Catalan", "gl": "Galician",
+    "af": "Afrikaans", "zu": "Zulu", "xh": "Xhosa", "sw": "Swahili", "am": "Amharic",
+    "so": "Somali", "ha": "Hausa", "yo": "Yoruba", "ig": "Igbo", "st": "Sotho",
+    "ka": "Georgian", "hy": "Armenian", "az": "Azerbaijani", "kk": "Kazakh",
+    "uz": "Uzbek", "ky": "Kyrgyz", "tg": "Tajik", "tk": "Turkmen", "ps": "Pashto",
+    "ku": "Kurdish", "sd": "Sindhi", "bo": "Tibetan", "dz": "Dzongkha",
+    "jv": "Javanese", "su": "Sundanese", "ceb": "Cebuano", "haw": "Hawaiian",
+    "mi": "Maori", "sm": "Samoan", "to": "Tongan", "fj": "Fijian",
+    "eo": "Esperanto", "la": "Latin", "yi": "Yiddish", "mt": "Maltese",
+    "lb": "Luxembourgish", "fo": "Faroese", "gd": "Scottish Gaelic", "br": "Breton",
+    "co": "Corsican", "oc": "Occitan", "rm": "Romansh", "gn": "Guarani",
+    "qu": "Quechua", "ay": "Aymara", "ht": "Haitian Creole",
 }
 
 UNKNOWN_TOKENS = {"", "und", "unknown", "unk", "n/a", "none"}
@@ -92,6 +124,26 @@ ISO2_TO_ISO3 = {
     "or": "ori", "en": "eng", "ja": "jpn", "ko": "kor", "es": "spa",
     "fr": "fre", "de": "ger", "ru": "rus", "zh": "chi", "it": "ita",
     "pt": "por", "ar": "ara", "tr": "tur",
+    "id": "ind", "ms": "may", "th": "tha", "vi": "vie", "tl": "fil",
+    "he": "heb", "fa": "per", "ur": "urd", "ne": "nep", "si": "sin",
+    "my": "bur", "km": "khm", "lo": "lao", "mn": "mon",
+    "nl": "dut", "sv": "swe", "no": "nor", "da": "dan", "fi": "fin",
+    "pl": "pol", "cs": "cze", "sk": "slo", "hu": "hun", "ro": "rum",
+    "el": "gre", "uk": "ukr", "bg": "bul", "hr": "hrv", "sr": "srp",
+    "sl": "slv", "bs": "bos", "mk": "mac", "sq": "alb",
+    "lt": "lit", "lv": "lav", "et": "est", "is": "ice",
+    "ga": "gle", "cy": "wel", "eu": "baq", "ca": "cat", "gl": "glg",
+    "af": "afr", "zu": "zul", "xh": "xho", "sw": "swa", "am": "amh",
+    "so": "som", "ha": "hau", "yo": "yor", "ig": "ibo", "st": "sot",
+    "ka": "geo", "hy": "arm", "az": "aze", "kk": "kaz",
+    "uz": "uzb", "ky": "kir", "tg": "tgk", "tk": "tuk", "ps": "pus",
+    "ku": "kur", "sd": "snd", "bo": "tib", "dz": "dzo",
+    "jv": "jav", "su": "sun", "ceb": "ceb", "haw": "haw",
+    "mi": "mao", "sm": "smo", "to": "ton", "fj": "fij",
+    "eo": "epo", "la": "lat", "yi": "yid", "mt": "mlt",
+    "lb": "ltz", "fo": "fao", "gd": "gla", "br": "bre",
+    "co": "cos", "oc": "oci", "rm": "roh", "gn": "grn",
+    "qu": "que", "ay": "aym", "ht": "hat",
 }
 
 NAME_TO_ISO3 = {}
@@ -196,6 +248,13 @@ def inspect_tracks(file_path):
 # ============================================================================
 
 def remux_single_audio(source_path, output_path, audio_track, subtitle_tracks):
+    """
+    Produces exactly one output file containing:
+      - the original video stream
+      - ONE specific audio stream (by its audio-only index)
+      - all subtitle streams from this same source file (if any) - EMBEDDED
+    All streams are stream-copied (-c copy) -> no quality loss, no re-encoding.
+    """
     audio_stream_index = audio_track["stream_index"]
     audio_iso3 = iso3_for_language(audio_track["language"])
 
@@ -255,14 +314,20 @@ def fetch_vidara_upload_server():
 _folder_id_cache = {}
 
 
-def get_or_create_vidara_folder(series_name, season_num, language):
-    """One folder per (series, season, language), e.g. 'Breaking Bad Season 1 English'."""
+def get_or_create_vidara_folder(series_name, season_num, quality, language):
+    """
+    One folder per (series, season, quality, language), e.g.
+    'Breaking Bad Season 1 1080p English', 'Breaking Bad Season 1 720p Hindi'.
+    Quality is now part of both the cache key and the folder name — before,
+    all qualities for a language shared one folder; now each quality gets
+    its own, matching what was asked for.
+    """
     clean_name = clean_string_for_vidara(series_name)
-    cache_key = (clean_name, int(season_num), language)
+    cache_key = (clean_name, int(season_num), quality, language)
     if cache_key in _folder_id_cache:
         return _folder_id_cache[cache_key]
 
-    folder_name = f"{clean_name} Season {int(season_num):02d} {language}"
+    folder_name = f"{clean_name} Season {int(season_num):02d} {quality} {language}"
     create_url = f"https://api.vidara.so/v1/folder/create?api_key={VIDARA_API_KEY}&name={requests.utils.quote(folder_name)}"
 
     try:
@@ -288,9 +353,6 @@ def extract_vidara_urls(data):
     result.url), stored AS-IS into BEAM — Vidara's embed domain has changed
     more than once (vidara.so -> vidaraa.cc -> vidara.to), so reconstructing
     or hardcoding a domain is fragile. Store exactly what they give back.
-
-    bare_filecode: just the last path segment, needed ONLY internally for
-    the subtitle-attach API, which requires the bare code rather than a URL.
     """
     full_url = data.get("url") or data.get("result", {}).get("url")
     filecode = data.get("filecode") or data.get("result", {}).get("filecode")
@@ -330,20 +392,15 @@ def upload_to_vidara(file_path, custom_name, folder_id=None):
 
 
 # ============================================================================
-# SUBTITLES — extract English tracks only, host them permanently and freely
-# on Internet Archive, then tell Vidara to attach that URL to the uploaded video's filecode.
-# Extracting straight from the same source file we split the audio from
-# guarantees the subtitle timing matches — no separate re-sync possible.
+# SUBTITLES — extract English tracks, host them on Archive.org + Litterbox
+# purely as backup/manual-reference copies. They are ALSO embedded directly
+# into the video via remux_single_audio, so hosting them is not the
+# delivery path anymore — just a convenience link dropped into the Error
+# cell. PGS/other image-based subtitle codecs can't convert to SRT, so
+# those fall back to a raw stream-copy (.sup) instead of being skipped.
 # ============================================================================
 
 def extract_subtitle_to_srt(source_path, subtitle_stream_index, output_srt_path):
-    """
-    Pulls ONE subtitle stream out of the source file as a standalone .srt.
-    Text-based subtitle codecs (srt/ass/webvtt/etc.) convert to srt cleanly
-    via -c:s srt. If a track is image-based (e.g. PGS/VobSub) ffmpeg can't
-    convert it to srt and this will fail — that's expected and handled by
-    the caller as a skip, not a hard error.
-    """
     cmd = [
         "ffmpeg", "-y",
         "-i", str(source_path),
@@ -357,6 +414,29 @@ def extract_subtitle_to_srt(source_path, subtitle_stream_index, output_srt_path)
     return True
 
 
+def extract_subtitle_raw_copy(source_path, subtitle_stream_index, output_path):
+    """
+    Fallback for image-based subtitle codecs (PGS/HDMV, VobSub, etc.) that
+    ffmpeg cannot convert to text-based SRT ("Subtitle encoding currently
+    only possible from text to text or bitmap to bitmap"). These still
+    stream-copy fine, so we pull the raw track out as-is (no conversion)
+    into a .sup container — not human-readable directly, but still a usable
+    backup (e.g. via SubtitleEdit/PgsToSrt locally). The same track is
+    already embedded in the video regardless of whether this succeeds.
+    """
+    cmd = [
+        "ffmpeg", "-y",
+        "-i", str(source_path),
+        "-map", f"0:s:{subtitle_stream_index}",
+        "-c:s", "copy",
+        str(output_path)
+    ]
+    result = subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True)
+    if result.returncode != 0 or not os.path.exists(output_path) or os.path.getsize(output_path) < 10:
+        raise Exception(f"ffmpeg raw subtitle copy failed: {result.stderr[-300:] if result.stderr else 'unknown error'}")
+    return True
+
+
 def slugify_for_ia(text, max_len=80):
     """
     Internet Archive item/bucket identifiers and S3 keys only allow
@@ -367,22 +447,16 @@ def slugify_for_ia(text, max_len=80):
     return (text.lower() or "item")[:max_len]
 
 
-def upload_to_archive_org(file_path, bucket_hint, key_hint, content_type="application/x-subrip", wait_seconds=60):
+def upload_to_archive_org(file_path, bucket_hint, key_hint, content_type="application/x-subrip", extension="srt", wait_seconds=60):
     """
     Uploads via Internet Archive's S3-compatible endpoint. `bucket_hint`
     should be something stable per show+season so multiple subtitle files
     land in the same IA "item" instead of creating a new one per file.
     x-amz-auto-make-bucket creates that item automatically if it doesn't
     exist yet. Storage is free and permanent — no expiry to manage.
-
-    IA can take anywhere from a few seconds to a couple minutes to make a
-    freshly uploaded file publicly fetchable, so this polls the direct
-    download URL briefly before handing it back — Vidara needs to fetch
-    it immediately, so handing back a URL that 404s yet would just move
-    the same failure mode over to a different host.
     """
     bucket = slugify_for_ia(f"beamplay-subs-{bucket_hint}")
-    key = slugify_for_ia(key_hint) + ".srt"
+    key = slugify_for_ia(key_hint) + f".{extension}"
     upload_url = f"https://s3.us.archive.org/{bucket}/{key}"
 
     headers = {
@@ -413,42 +487,8 @@ def upload_to_archive_org(file_path, bucket_hint, key_hint, content_type="applic
             pass
         time.sleep(5)
 
-    # Didn't confirm propagation within the wait window — hand the URL back
-    # anyway. Worst case Vidara's fetch fails once and this episode's
-    # subtitle becomes one of the "manual attach" warnings, same as any
-    # other subtitle-stage failure.
     print(f"         [WARN] Archive.org file not confirmed reachable after {wait_seconds}s, proceeding anyway: {direct_url}")
     return direct_url
-
-
-def attach_subtitle_to_vidara(filecode, sub_url, sub_lang="English"):
-    """
-    Raises a SHORT, clean exception on failure — never the raw response
-    (which would otherwise include the full request URL, and therefore
-    your Vidara API key in plaintext, in whatever error text ends up in
-    the sheet).
-    """
-    try:
-        res = requests.get(
-            "https://api.vidara.so/v1/upload/sub",
-            params={"api_key": VIDARA_API_KEY, "filecode": filecode, "sub_lang": sub_lang, "sub_url": sub_url},
-            timeout=30
-        )
-    except requests.exceptions.RequestException as e:
-        raise Exception(f"network error ({type(e).__name__})")
-
-    if res.status_code != 200:
-        raise Exception(f"HTTP {res.status_code}")
-
-    try:
-        data = res.json()
-    except ValueError:
-        raise Exception(f"HTTP {res.status_code}, non-JSON response")
-
-    if data.get("status") != 200:
-        raise Exception(f"Vidara status {data.get('status')}: {str(data.get('msg', 'no message'))[:150]}")
-
-    return True
 
 
 LITTERBOX_API = "https://litterbox.catbox.moe/resources/internals/api.php"
@@ -457,11 +497,7 @@ LITTERBOX_API = "https://litterbox.catbox.moe/resources/internals/api.php"
 def upload_to_litterbox(file_path, expire="72h"):
     """
     Second hosting copy, uploaded alongside Archive.org (not just as a
-    fallback-on-exception) — some Vidara-side attach failures turn out to
-    be Vidara's own fetcher choking on something Archive.org-specific, so
-    having a second, differently-hosted copy ready to try is what actually
-    resolves those, not just retrying the same URL. Free, no-signup,
-    temporary (72h is plenty for a subtitle to get attached).
+    fallback-on-exception). Free, no-signup, temporary (72h).
     """
     with open(file_path, "rb") as fh:
         response = requests.post(
@@ -477,24 +513,23 @@ def upload_to_litterbox(file_path, expire="72h"):
     return url
 
 
-def host_subtitle_everywhere(srt_path, bucket_hint, key_hint):
+def host_subtitle_everywhere(sub_path, bucket_hint, key_hint, content_type="application/x-subrip", extension="srt"):
     """
-    Hosts the same .srt on BOTH Archive.org and Litterbox (not one-then-
+    Hosts the same file on BOTH Archive.org and Litterbox (not one-then-
     fallback) — whichever succeed get returned as a list of (url, host)
-    pairs, so the caller can try attaching with each one until one works.
-    Raises only if BOTH hosts fail.
+    pairs. Raises only if BOTH hosts fail.
     """
     hosted = []
     errors = []
 
     try:
-        url = upload_to_archive_org(srt_path, bucket_hint, key_hint)
+        url = upload_to_archive_org(sub_path, bucket_hint, key_hint, content_type=content_type, extension=extension)
         hosted.append((url, "Archive.org"))
     except Exception as e:
         errors.append(f"Archive.org: {e}")
 
     try:
-        url = upload_to_litterbox(srt_path)
+        url = upload_to_litterbox(sub_path)
         hosted.append((url, "Litterbox"))
     except Exception as e:
         errors.append(f"Litterbox: {e}")
@@ -505,31 +540,18 @@ def host_subtitle_everywhere(srt_path, bucket_hint, key_hint):
     return hosted
 
 
-def attach_first_working(filecode, hosted_urls, sub_lang="English"):
-    """
-    Tries attaching each (url, host) pair in order until Vidara accepts
-    one. Returns the host name that worked. If all fail, raises a single
-    clean summary — no leaked keys, no raw query strings.
-    """
-    attempts = []
-    for url, host in hosted_urls:
-        try:
-            attach_subtitle_to_vidara(filecode, url, sub_lang)
-            return host
-        except Exception as e:
-            attempts.append(f"{host} ({e})")
-
-    raise Exception("all hosts failed: " + "; ".join(attempts))
-
-
 def prepare_english_subtitle_urls(source_path, subtitle_tracks, bucket_hint, tmp_prefix):
     """
     Extracts every subtitle track normalized to 'English' and hosts each on
-    BOTH Archive.org and Litterbox (see host_subtitle_everywhere). Returns
-    (candidates, failure_reasons), where each candidate is
-    {"hosts": [(url, host_name), ...]} — one entry per subtitle track, with
-    up to two hosted copies each. A track only ends up in failure_reasons
-    if BOTH hosts failed to take the upload at all.
+    BOTH Archive.org and Litterbox, purely so we have shareable backup links
+    for the Error cell. (These same subtitle tracks are separately embedded
+    straight into the output video via remux_single_audio — this hosting
+    step is not required for playback, just for manual reference.)
+
+    Returns (candidates, failure_reasons), where each candidate is
+    {"hosts": [(url, host_name), ...], "format": "srt" | "sup (...)"}.
+    A track only ends up in failure_reasons if BOTH hosts failed AND both
+    the srt conversion and the raw-copy fallback failed.
     """
     candidates = []
     failures = []
@@ -539,17 +561,32 @@ def prepare_english_subtitle_urls(source_path, subtitle_tracks, bucket_hint, tmp
 
     for idx, sub in enumerate(english_tracks):
         srt_path = os.path.join(TEMP_FOLDER, f"{tmp_prefix}_sub{idx}.srt")
+        sup_path = os.path.join(TEMP_FOLDER, f"{tmp_prefix}_sub{idx}.sup")
         try:
             extract_subtitle_to_srt(source_path, sub["stream_index"], srt_path)
             hosted = host_subtitle_everywhere(srt_path, bucket_hint, f"{tmp_prefix}_sub{idx}")
-            candidates.append({"hosts": hosted})
+            candidates.append({"hosts": hosted, "format": "srt"})
             for url, host in hosted:
-                print(f"         [SUB] English subtitle #{idx+1} hosted via {host} -> {url}")
-        except Exception as e:
-            failures.append(f"track #{idx+1}: {e}")
-            print(f"         [WARN] Could not prepare English subtitle #{idx+1}: {e}")
+                print(f"         [SUB] English subtitle #{idx+1} (srt) hosted via {host} -> {url}")
+        except Exception as srt_err:
+            # Text conversion failed — most likely an image-based codec
+            # (PGS/HDMV, VobSub, etc). Fall back to a raw stream-copy
+            # instead of giving up.
+            try:
+                extract_subtitle_raw_copy(source_path, sub["stream_index"], sup_path)
+                hosted = host_subtitle_everywhere(
+                    sup_path, bucket_hint, f"{tmp_prefix}_sub{idx}",
+                    content_type="application/octet-stream", extension="sup"
+                )
+                candidates.append({"hosts": hosted, "format": "sup (image-based, needs OCR)"})
+                for url, host in hosted:
+                    print(f"         [SUB] English subtitle #{idx+1} (raw .sup, image-based) hosted via {host} -> {url}")
+            except Exception as raw_err:
+                failures.append(f"track #{idx+1}: {raw_err}")
+                print(f"         [WARN] Could not prepare English subtitle #{idx+1} as srt ({srt_err}) or raw copy ({raw_err})")
         finally:
             safe_delete(srt_path)
+            safe_delete(sup_path)
 
     return candidates, failures
 
@@ -579,9 +616,28 @@ def beam_upsert(jwt, tmdb_id, season, episode, quality, language, url):
 
 def download_file(url, dest_path):
     cmd = [
-        "aria2c", "-x", "8", "-s", "8", "-k", "5M",
-        "--file-allocation=none", "--summary-interval=0", "--retry-wait=10",
-        "--max-tries=8", "--timeout=45", "--auto-file-renaming=false",
+        "aria2c",
+        "-x", "16",              # max connections PER SERVER (was 8) — most
+                                  # slowdowns on hosts like this are per-
+                                  # connection throttling, not actual
+                                  # runner bandwidth, so more parallel
+                                  # connections is what speeds this up.
+        "-s", "16",               # split file into 16 pieces (was 8)
+        "-j", "16",               # max concurrent downloads (keeps aria2c
+                                  # from capping itself below -x/-s)
+        "-k", "1M",               # smaller min split size (was 5M) so 16
+                                  # connections can actually be used
+        "--file-allocation=none",
+        "--summary-interval=0",
+        "--retry-wait=5",        # was 10 — retry faster on transient drops
+        "--max-tries=8",
+        "--timeout=45",
+        "--connect-timeout=15",
+        "--auto-file-renaming=false",
+        "--disable-ipv6=true",
+        "--max-connection-per-server=16",
+        "--min-split-size=1M",
+        "--user-agent=Mozilla/5.0",
         "-d", os.path.dirname(dest_path), "-o", os.path.basename(dest_path), url
     ]
     result = subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True)
@@ -629,27 +685,36 @@ def format_error(episode, language, stage, reason):
 # ============================================================================
 
 def process_episode_file(jwt, tmdb_id, series_name, season_num, episode_num,
-                          quality, source_path, already_done_langs, subtitle_warnings):
+                          quality, source_path, already_done_langs, subtitle_notes):
     """
     `already_done_langs` is a set (mutated in place) of languages already
     uploaded for THIS episode within THIS row's scope. Raises on failure.
-    `subtitle_warnings` is a list (mutated in place) of human-readable notes
-    for any caption that didn't get attached — always includes the direct
-    Archive.org link when one was successfully generated, so it can be
-    downloaded and attached to that filecode by hand.
+    `subtitle_notes` is a list (mutated in place) of human-readable notes
+    with the hosted Archive.org / Litterbox backup links for the English
+    subtitle(s) found in this episode — for manual reference. Subtitles are
+    already embedded in the uploaded video itself, so this is not a failure
+    indicator, just a convenience record.
     """
     audio_tracks, subtitle_tracks = inspect_tracks(source_path)
     print(f"         Audio: {[a['language'] for a in audio_tracks]}"
           + (f" | Subs: {[s['language'] for s in subtitle_tracks]}" if subtitle_tracks else ""))
 
-    # Extract + host every English subtitle track ONCE for this episode —
-    # same captions get attached to every audio-language video we upload
-    # below, so there's no need to redo this per audio track.
+    # Host every English subtitle track from this episode as backup copies
+    # (Archive.org + Litterbox). These are NOT sent to any attach API —
+    # the links are only recorded for manual/reference use. The actual
+    # delivery of subtitles happens via direct embedding below.
     subtitle_candidates, prep_failures = prepare_english_subtitle_urls(
         source_path, subtitle_tracks, f"{tmdb_id}-s{season_num}", f"{tmdb_id}_S{season_num}E{episode_num}_{quality}"
     )
+    if subtitle_candidates:
+        for cand_idx, candidate in enumerate(subtitle_candidates, start=1):
+            links_str = " | ".join(f"{host}: {url}" for url, host in candidate["hosts"])
+            fmt = candidate.get("format", "srt")
+            subtitle_notes.append(
+                f"S{season_num}E{episode_num} {quality}: English subtitle #{cand_idx} backup [{fmt}] — {links_str}"
+            )
     for fail_reason in prep_failures:
-        subtitle_warnings.append(
+        subtitle_notes.append(
             f"S{season_num}E{episode_num} {quality}: could not extract/host English subtitle — {fail_reason}"
         )
 
@@ -663,8 +728,11 @@ def process_episode_file(jwt, tmdb_id, series_name, season_num, episode_num,
         output_path = os.path.join(OUTPUT_FOLDER, output_name)
 
         try:
-            remux_single_audio(source_path, output_path, track, [])  # subs handled via API below, not embedded
-            folder_id = get_or_create_vidara_folder(series_name, season_num, lang)
+            # Embed ALL subtitle tracks from this same source file directly
+            # into the output (stream-copy, no re-encode). This is the
+            # actual delivery mechanism for captions now.
+            remux_single_audio(source_path, output_path, track, subtitle_tracks)
+            folder_id = get_or_create_vidara_folder(series_name, season_num, quality, lang)
             video_url, filecode = upload_to_vidara(output_path, output_name, folder_id)
             beam_upsert(jwt, tmdb_id, season_num, episode_num, quality, lang, video_url)
         except Exception as e:
@@ -673,24 +741,7 @@ def process_episode_file(jwt, tmdb_id, series_name, season_num, episode_num,
 
         safe_delete(output_path)
         already_done_langs.add(lang)
-        print(f"         [OK] S{int(season_num):02d}E{int(episode_num):02d} {lang} uploaded ({video_url}).")
-
-        # Best-effort: try attaching each subtitle candidate, using whichever
-        # hosted copy (Archive.org or Litterbox) actually works. Only a
-        # candidate where BOTH hosted copies fail to attach becomes a warning.
-        for candidate in subtitle_candidates:
-            try:
-                used_host = attach_first_working(filecode, candidate["hosts"], sub_lang="English")
-                print(f"         [SUB] Attached English caption via {used_host} to {filecode}")
-            except Exception as e:
-                links = " | ".join(f"{host}: {url}" for url, host in candidate["hosts"])
-                warning = (
-                    f"S{season_num}E{episode_num} {quality} [{lang}] video {video_url}: "
-                    f"subtitle attach failed on every hosted copy ({e}). "
-                    f"Manual download — {links}"
-                )
-                subtitle_warnings.append(warning)
-                print(f"         [WARN] {warning}")
+        print(f"         [OK] S{int(season_num):02d}E{int(episode_num):02d} {lang} uploaded (with embedded subtitles) ({video_url}).")
 
 
 # ============================================================================
@@ -706,15 +757,15 @@ def process_single_row(jwt, tmdb_id, series_name, season, episode, quality, link
         safe_delete(temp_path)
         raise Exception(("Download", "Episode download failed after retries"))
 
-    subtitle_warnings = []
+    subtitle_notes = []
     try:
-        process_episode_file(jwt, tmdb_id, series_name, season, episode, quality, temp_path, set(), subtitle_warnings)
+        process_episode_file(jwt, tmdb_id, series_name, season, episode, quality, temp_path, set(), subtitle_notes)
     except Exception as e:
         safe_delete(temp_path)
         raise Exception(("Split/Upload", str(e)))
 
     safe_delete(temp_path)
-    return 1, subtitle_warnings  # one episode handled
+    return 1, subtitle_notes  # one episode handled
 
 
 def process_zip_row(jwt, tmdb_id, series_name, season, quality, link):
@@ -736,7 +787,7 @@ def process_zip_row(jwt, tmdb_id, series_name, season, quality, link):
 
     episodes_done = 0
     processed = {}  # episode_num -> set(languages already uploaded, this zip only)
-    subtitle_warnings = []
+    subtitle_notes = []
 
     try:
         with zipfile.ZipFile(zip_path, 'r') as archive:
@@ -758,7 +809,7 @@ def process_zip_row(jwt, tmdb_id, series_name, season, quality, link):
                 done_langs = processed.setdefault(ep_num, set())
 
                 try:
-                    process_episode_file(jwt, tmdb_id, series_name, season, ep_num, quality, extract_target, done_langs, subtitle_warnings)
+                    process_episode_file(jwt, tmdb_id, series_name, season, ep_num, quality, extract_target, done_langs, subtitle_notes)
                 except Exception as e:
                     safe_delete(extract_target)
                     safe_delete(zip_path)
@@ -773,7 +824,7 @@ def process_zip_row(jwt, tmdb_id, series_name, season, quality, link):
         raise Exception(("ZIP Read", str(e)))
 
     safe_delete(zip_path)
-    return episodes_done, subtitle_warnings
+    return episodes_done, subtitle_notes
 
 
 # ============================================================================
@@ -891,18 +942,18 @@ def main():
 
         try:
             if link_type == "SINGLE":
-                _count, subtitle_warnings = process_single_row(jwt, tmdb_id, series_name, season, episode, quality, link)
+                _count, subtitle_notes = process_single_row(jwt, tmdb_id, series_name, season, episode, quality, link)
             else:
-                _count, subtitle_warnings = process_zip_row(jwt, tmdb_id, series_name, season, quality, link)
+                _count, subtitle_notes = process_zip_row(jwt, tmdb_id, series_name, season, quality, link)
 
             pipeline_sheet.update_cell(row_idx, pcol["DOWNLOAD_STATUS"], "Done")
-            if subtitle_warnings:
-                # Row still counts as Done (video uploaded fine) — Error just
-                # notes which captions need manual attaching, with the direct
-                # download link for each one.
-                note = "DONE — but some subtitles need manual attach:\n\n" + "\n\n".join(subtitle_warnings)
+            if subtitle_notes:
+                # Row is Done either way (subtitles are embedded). This
+                # note is just the backup Archive.org/Litterbox links for
+                # the extracted English subtitles.
+                note = "DONE — subtitle backup links:\n\n" + "\n\n".join(subtitle_notes)
                 pipeline_sheet.update_cell(row_idx, pcol["Error"], note[:1500])
-                print(f"    [DONE with subtitle warnings] Row {row_idx}")
+                print(f"    [DONE with subtitle backup links] Row {row_idx}")
             else:
                 pipeline_sheet.update_cell(row_idx, pcol["Error"], "")
                 print(f"    [DONE] Row {row_idx}")
@@ -996,16 +1047,14 @@ def main():
             if p_tmdb == tmdb_id and p_season == season:
                 if p_error:
                     # Row is Done, but still has an unresolved note (e.g. a
-                    # subtitle that needs manual attaching). Keep it around
-                    # instead of silently discarding that info — it just
-                    # becomes a leftover reference row you can clear once
-                    # you've handled it.
+                    # subtitle backup link worth keeping visible). Keep it
+                    # around instead of silently discarding that info.
                     kept_for_warnings += 1
                     continue
                 pipeline_sheet.delete_rows(j + 1)
 
         if kept_for_warnings:
-            print(f"[OK] Archived. Kept {kept_for_warnings} Pipeline row(s) with unresolved warnings — check their Error column.")
+            print(f"[OK] Archived. Kept {kept_for_warnings} Pipeline row(s) with unresolved notes — check their Error column.")
         else:
             print(f"[OK] Archived and cleaned up.")
 
