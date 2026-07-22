@@ -1,25 +1,20 @@
 name: Series Downloader
 on:
   workflow_dispatch:
-
 jobs:
   download:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-
       - uses: actions/setup-python@v5
         with:
           python-version: '3.11'
-
       - name: Install Python Dependencies
-        run: pip install gspread google-auth pymediainfo requests requests-toolbelt
-
+        run: pip install gspread google-auth pymediainfo requests requests-toolbelt pgsrip
       - name: Install System Dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y aria2 mediainfo ffmpeg
-
+          sudo apt-get install -y aria2 mediainfo ffmpeg mkvtoolnix tesseract-ocr tesseract-ocr-eng
       - name: Run Series Downloader
         env:
           GOOGLE_SHEETS_JSON: ${{ secrets.GOOGLE_SHEETS_JSON }}
