@@ -459,31 +459,43 @@ def extract_subtitle_raw_copy(source_path, subtitle_stream_index, output_path):
     return True
 
 
-def ocr_sup_to_srt(sup_path, srt_path, timeout_seconds=600):
+def fix_common_ocr_errors(text):
     """
-    Converts an extracted PGS/HDMV bitmap subtitle (.sup) into a real,
-    readable .srt using `pgsrip` (which wraps mkvtoolnix + tesseract).
-    pgsrip works directly on a standalone .sup file and writes a sibling
-    .srt with the same basename, so we point it at a dedicated temp file
-    and then move/rename the result to `srt_path`.
+    Tesseract very commonly misreads a capital "I" as a pipe character —
+    e.g. "| wanna catch him" instead of "I wanna catch him". This is a
+    well-known failure mode (worse on lower-accuracy trained data), not
+    random corruption. Movie/TV dialogue essentially never contains a
+    literal "|", so a blanket replace here is safe and high-precision —
+    used as a safety net on top of using the more accurate tessdata_best
+    model (the real fix; this just catches whatever still slips through).
+    """
+    return text.replace("|", "I")
 
-    Kept strictly sequential (one track at a time, never run in parallel
+
+def ocr_pgs_from_source(source_path, language_code="en", timeout_seconds=600):
+    """
+    Runs pgsrip directly on the ORIGINAL media file — NOT a pre-extracted
+    standalone .sup. pgsrip uses mkvextract internally to pull PGS tracks
+    straight out of the container, which produces output its own
+    type-detection recognizes. A manually ffmpeg-extracted .sup gets
+    silently rejected by pgsrip's detector ("0 PGS subtitle collected"),
+    even though the track itself is perfectly fine — the detection step,
+    not the OCR step, was the actual problem with that approach.
+
+    pgsrip names its output next to the source file as
+    "<basename-without-ext>.<language_code>.srt" (e.g. "episode.en.srt"
+    for "episode.mkv" with language_code="en"). Raises if that file never
+    appears, or looks empty/corrupt, or the process times out.
+
+    Kept strictly sequential (one file at a time, never run in parallel
     with other OCR jobs) — tesseract is CPU-heavy, so parallelizing this
     on a shared CI runner just causes contention and slows everything
-    down rather than speeding it up. A timeout guards against a corrupt
-    or unusually large .sup file hanging the whole pipeline.
-
-    Returns True on success. Raises on failure (missing pgsrip, no
-    output produced, or timeout) so the caller can fall back to the raw
-    .sup copy instead of losing the track entirely.
+    down rather than speeding it up.
     """
-    sup_path = str(sup_path)
-    expected_srt = os.path.splitext(sup_path)[0] + ".srt"
-
-    cmd = ["pgsrip", sup_path]
+    cmd = ["pgsrip", "-l", language_code, str(source_path)]
     try:
         result = subprocess.run(
-            cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
+            cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
             text=True, timeout=timeout_seconds
         )
     except FileNotFoundError:
@@ -491,12 +503,18 @@ def ocr_sup_to_srt(sup_path, srt_path, timeout_seconds=600):
     except subprocess.TimeoutExpired:
         raise Exception(f"pgsrip OCR timed out after {timeout_seconds}s")
 
-    if result.returncode != 0 or not os.path.exists(expected_srt) or os.path.getsize(expected_srt) < 10:
-        raise Exception(f"pgsrip OCR produced no usable output: {result.stderr[-300:] if result.stderr else 'unknown error'}")
+    base, _ = os.path.splitext(str(source_path))
+    expected_srt = f"{base}.{language_code}.srt"
 
-    if expected_srt != srt_path:
-        shutil.move(expected_srt, srt_path)
-    return True
+    if not os.path.exists(expected_srt) or os.path.getsize(expected_srt) < 10:
+        raise Exception(f"pgsrip produced no usable output: {(result.stderr or result.stdout)[-300:]}")
+
+    with open(expected_srt, "r", encoding="utf-8", errors="replace") as f:
+        corrected = fix_common_ocr_errors(f.read())
+    with open(expected_srt, "w", encoding="utf-8") as f:
+        f.write(corrected)
+
+    return expected_srt
 
 
 def slugify_for_ia(text, max_len=80):
@@ -630,10 +648,13 @@ def prepare_english_subtitle_urls(source_path, subtitle_tracks, bucket_hint, tmp
     if not english_tracks:
         return candidates, failures, srt_overrides
 
+    whole_file_ocr_tried = False
+    whole_file_ocr_srt = None
+    whole_file_ocr_error = None
+
     for idx, sub in enumerate(english_tracks):
         srt_path = os.path.join(TEMP_FOLDER, f"{tmp_prefix}_sub{idx}.srt")
         sup_path = os.path.join(TEMP_FOLDER, f"{tmp_prefix}_sub{idx}.sup")
-        ocr_srt_path = os.path.join(TEMP_FOLDER, f"{tmp_prefix}_sub{idx}_ocr.srt")
 
         try:
             # Fast path: source codec is already text-based (SRT/ASS/etc.)
@@ -646,41 +667,48 @@ def prepare_english_subtitle_urls(source_path, subtitle_tracks, bucket_hint, tmp
             continue
         except Exception as srt_err:
             safe_delete(srt_path)
-            # Text conversion failed — most likely an image-based codec
-            # (PGS/HDMV, VobSub, etc). Pull the raw bitmap track out, then
-            # run it through OCR to get real text instead of just parking
-            # an unreadable .sup as the "backup".
-            pass
 
+        # Image-based track — OCR the whole episode file once, reuse the
+        # result for any further English PGS tracks in this same episode.
+        if not whole_file_ocr_tried:
+            whole_file_ocr_tried = True
+            try:
+                produced_path = ocr_pgs_from_source(source_path, language_code="en")
+                shutil.copy(produced_path, srt_path)
+                safe_delete(produced_path)  # pgsrip's own output, next to source — clean it up
+                whole_file_ocr_srt = srt_path
+            except Exception as e:
+                whole_file_ocr_error = str(e)
+                print(f"         [WARN] PGS OCR failed: {e}")
+        elif whole_file_ocr_srt:
+            shutil.copy(whole_file_ocr_srt, srt_path)
+
+        if whole_file_ocr_srt and os.path.exists(srt_path):
+            try:
+                hosted = host_subtitle_everywhere(srt_path, bucket_hint, f"{tmp_prefix}_sub{idx}")
+                candidates.append({"hosts": hosted, "format": "srt (OCR)"})
+                srt_overrides[sub["stream_index"]] = srt_path  # kept, not deleted here
+                for url, host in hosted:
+                    print(f"         [SUB] English subtitle #{idx+1} (OCR'd from PGS) hosted via {host} -> {url}")
+                continue
+            except Exception as host_err:
+                safe_delete(srt_path)
+                failures.append(f"track #{idx+1}: OCR succeeded but hosting failed ({host_err})")
+                continue
+
+        # OCR unavailable/failed — last resort: raw, unconverted backup.
         try:
             extract_subtitle_raw_copy(source_path, sub["stream_index"], sup_path)
-        except Exception as raw_err:
-            failures.append(f"track #{idx+1}: could not extract subtitle stream at all — {raw_err}")
-            print(f"         [WARN] Could not extract English subtitle #{idx+1} in any form ({raw_err})")
-            continue
-
-        try:
-            ocr_sup_to_srt(sup_path, ocr_srt_path)
-            hosted = host_subtitle_everywhere(ocr_srt_path, bucket_hint, f"{tmp_prefix}_sub{idx}")
-            candidates.append({"hosts": hosted, "format": "srt (OCR)"})
-            srt_overrides[sub["stream_index"]] = ocr_srt_path  # kept, not deleted here
+            hosted = host_subtitle_everywhere(
+                sup_path, bucket_hint, f"{tmp_prefix}_sub{idx}",
+                content_type="application/octet-stream", extension="sup"
+            )
+            candidates.append({"hosts": hosted, "format": "sup (OCR failed, raw)"})
             for url, host in hosted:
-                print(f"         [SUB] English subtitle #{idx+1} (OCR'd to srt) hosted via {host} -> {url}")
-        except Exception as ocr_err:
-            # OCR failed (pgsrip missing/timeout/etc) — fall back to
-            # hosting the raw .sup so there's still SOMETHING to work
-            # with manually, and note that OCR didn't happen.
-            print(f"         [WARN] PGS OCR failed for English subtitle #{idx+1} ({ocr_err}); falling back to raw .sup")
-            try:
-                hosted = host_subtitle_everywhere(
-                    sup_path, bucket_hint, f"{tmp_prefix}_sub{idx}",
-                    content_type="application/octet-stream", extension="sup"
-                )
-                candidates.append({"hosts": hosted, "format": "sup (OCR failed, raw)"})
-                for url, host in hosted:
-                    print(f"         [SUB] English subtitle #{idx+1} (raw .sup, OCR failed) hosted via {host} -> {url}")
-            except Exception as raw_host_err:
-                failures.append(f"track #{idx+1}: OCR failed ({ocr_err}) and raw hosting failed ({raw_host_err})")
+                print(f"         [SUB] English subtitle #{idx+1} (raw .sup, OCR failed) hosted via {host} -> {url}")
+        except Exception as raw_err:
+            failures.append(f"track #{idx+1}: srt failed ({srt_err}); OCR failed ({whole_file_ocr_error}); raw backup failed ({raw_err})")
+            print(f"         [WARN] Could not prepare English subtitle #{idx+1} via any method")
         finally:
             safe_delete(sup_path)
 
