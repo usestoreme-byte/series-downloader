@@ -91,7 +91,7 @@ for p in [TEMP_FOLDER, OUTPUT_FOLDER]:
 LANG_MAP = {
     "as": "Assamese", "te": "Telugu", "hi": "Hindi", "ta": "Tamil", "ml": "Malayalam",
     "kn": "Kannada", "bn": "Bengali", "pa": "Punjabi", "gu": "Gujarati", "mr": "Marathi",
-    "or": "Oriya", "en": "English", "ja": "Japanese", "ko": "Korean", "es": "Spanish",
+    "or": "Oriya", "is": "English", "ja": "Japanese", "ko": "Korean", "es": "Spanish",
     "fr": "French", "de": "German", "ru": "Russian", "zh": "Chinese", "it": "Italian",
     "pt": "Portuguese", "ar": "Arabic", "tr": "Turkish",
     "id": "Indonesian", "ms": "Malay", "th": "Thai", "vi": "Vietnamese", "tl": "Filipino",
@@ -121,7 +121,7 @@ UNKNOWN_TOKENS = {"", "und", "unknown", "unk", "n/a", "none"}
 ISO2_TO_ISO3 = {
     "as": "asm", "te": "tel", "hi": "hin", "ta": "tam", "ml": "mal",
     "kn": "kan", "bn": "ben", "pa": "pan", "gu": "guj", "mr": "mar",
-    "or": "ori", "en": "eng", "ja": "jpn", "ko": "kor", "es": "spa",
+    "or": "ori", "is": "eng", "ja": "jpn", "ko": "kor", "es": "spa",
     "fr": "fre", "de": "ger", "ru": "rus", "zh": "chi", "it": "ita",
     "pt": "por", "ar": "ara", "tr": "tur",
     "id": "ind", "ms": "may", "th": "tha", "vi": "vie", "tl": "fil",
