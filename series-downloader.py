@@ -161,9 +161,22 @@ def iso3_for_language(language_name):
 # NORMALIZATION
 # ============================================================================
 
-def normalize_audio_lang(raw_code, raw_name=None):
+# Per-series audio-language overrides: some releases mistag a track with
+# the wrong ISO code (e.g. "is" = Icelandic used by mistake for what's
+# actually English audio). Keyed by TMDB_ID (as a string) so this ONLY
+# applies to that specific show — every other series still goes through
+# the normal LANG_MAP lookup untouched, so a real Icelandic track on a
+# different show is never affected.
+SERIES_AUDIO_LANG_OVERRIDES = {
+    "1399": {"is": "English"},
+}
+
+
+def normalize_audio_lang(raw_code, raw_name=None, override_map=None):
     """Audio must NEVER guess. Unrecognized/blank stays 'Unknown'."""
     code = (raw_code or "").strip().lower()
+    if override_map and code in override_map:
+        return override_map[code]
     if code in LANG_MAP:
         return LANG_MAP[code]
     name = (raw_name or "").strip()
@@ -217,19 +230,23 @@ def natural_sort_key(name):
 # MEDIAINFO
 # ============================================================================
 
-def inspect_tracks(file_path):
+def inspect_tracks(file_path, tmdb_id=None):
     """
     Returns:
         audio_tracks    = [ { "stream_index": int, "language": "English" }, ... ]
         subtitle_tracks = [ { "stream_index": int, "language": "English" }, ... ]
+    `tmdb_id` is looked up in SERIES_AUDIO_LANG_OVERRIDES so a bad tag can
+    be corrected for just that one show without touching every other series.
     """
+    override_map = SERIES_AUDIO_LANG_OVERRIDES.get(str(tmdb_id)) if tmdb_id is not None else None
+
     media = MediaInfo.parse(str(file_path))
     audio_tracks, subtitle_tracks = [], []
     audio_pos, sub_pos = 0, 0
 
     for track in media.tracks:
         if track.track_type == "Audio":
-            lang = normalize_audio_lang(track.language, getattr(track, "language_full", None))
+            lang = normalize_audio_lang(track.language, getattr(track, "language_full", None), override_map)
             audio_tracks.append({"stream_index": audio_pos, "language": lang})
             audio_pos += 1
         elif track.track_type == "Text":
@@ -859,7 +876,7 @@ def process_episode_file(jwt, tmdb_id, series_name, season_num, episode_num,
     already embedded in the uploaded video itself, so this is not a failure
     indicator, just a convenience record.
     """
-    audio_tracks, subtitle_tracks = inspect_tracks(source_path)
+    audio_tracks, subtitle_tracks = inspect_tracks(source_path, tmdb_id=tmdb_id)
     print(f"         Audio: {[a['language'] for a in audio_tracks]}"
           + (f" | Subs: {[s['language'] for s in subtitle_tracks]}" if subtitle_tracks else ""))
 
