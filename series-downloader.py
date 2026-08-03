@@ -91,7 +91,7 @@ for p in [TEMP_FOLDER, OUTPUT_FOLDER]:
 LANG_MAP = {
     "as": "Assamese", "te": "Telugu", "hi": "Hindi", "ta": "Tamil", "ml": "Malayalam",
     "kn": "Kannada", "bn": "Bengali", "pa": "Punjabi", "gu": "Gujarati", "mr": "Marathi",
-    "or": "Oriya", "is": "English", "ja": "Japanese", "ko": "Korean", "es": "Spanish",
+    "or": "Oriya", "en": "English", "ja": "Japanese", "ko": "Korean", "es": "Spanish",
     "fr": "French", "de": "German", "ru": "Russian", "zh": "Chinese", "it": "Italian",
     "pt": "Portuguese", "ar": "Arabic", "tr": "Turkish",
     "id": "Indonesian", "ms": "Malay", "th": "Thai", "vi": "Vietnamese", "tl": "Filipino",
@@ -121,7 +121,7 @@ UNKNOWN_TOKENS = {"", "und", "unknown", "unk", "n/a", "none"}
 ISO2_TO_ISO3 = {
     "as": "asm", "te": "tel", "hi": "hin", "ta": "tam", "ml": "mal",
     "kn": "kan", "bn": "ben", "pa": "pan", "gu": "guj", "mr": "mar",
-    "or": "ori", "is": "eng", "ja": "jpn", "ko": "kor", "es": "spa",
+    "or": "ori", "en": "eng", "ja": "jpn", "ko": "kor", "es": "spa",
     "fr": "fre", "de": "ger", "ru": "rus", "zh": "chi", "it": "ita",
     "pt": "por", "ar": "ara", "tr": "tur",
     "id": "ind", "ms": "may", "th": "tha", "vi": "vie", "tl": "fil",
@@ -336,20 +336,22 @@ def fetch_vidara_upload_server():
 _folder_id_cache = {}
 
 
-def get_or_create_vidara_folder(series_name, season_num, quality, language):
+def get_or_create_vidara_folder(series_name, season_num, quality, languages):
     """
-    One folder per (series, season, quality, language), e.g.
-    'Breaking Bad Season 1 1080p English', 'Breaking Bad Season 1 720p Hindi'.
-    Quality is now part of both the cache key and the folder name — before,
-    all qualities for a language shared one folder; now each quality gets
-    its own, matching what was asked for.
+    ONE folder per (series, season, quality) — e.g.
+    'Game of Thrones Season 1 1080p Tam Tel Hin Eng'. `languages` is the
+    full list of audio languages found for this episode; they're all
+    joined (abbreviated) into a single folder name. Cache key deliberately
+    does NOT include language, so every language for this quality reuses
+    the exact same folder instead of creating a new one per language.
     """
     clean_name = clean_string_for_vidara(series_name)
-    cache_key = (clean_name, int(season_num), quality, language)
+    cache_key = (clean_name, int(season_num), quality)
     if cache_key in _folder_id_cache:
         return _folder_id_cache[cache_key]
 
-    folder_name = f"{clean_name} Season {int(season_num):02d} {quality} {language}"
+    lang_str = " ".join(l[:3] for l in languages)
+    folder_name = f"{clean_name} Season {int(season_num):02d} {quality} {lang_str}"
     create_url = f"https://api.vidara.so/v1/folder/create?api_key={VIDARA_API_KEY}&name={requests.utils.quote(folder_name)}"
 
     try:
@@ -872,6 +874,16 @@ def process_episode_file(jwt, tmdb_id, series_name, season_num, episode_num,
     subtitle_candidates, prep_failures, subtitle_srt_overrides = prepare_english_subtitle_urls(
         source_path, subtitle_tracks, f"{tmdb_id}-s{season_num}", f"{tmdb_id}_S{season_num}E{episode_num}_{quality}"
     )
+    # One folder for this whole quality — built from every language found
+    # in THIS episode's audio tracks. Only the first episode to reach this
+    # for a given (series, season, quality) actually creates the folder;
+    # every later episode/language reuses that same folder_id via the cache.
+    all_langs_this_episode = []
+    for t in audio_tracks:
+        if t["language"] not in all_langs_this_episode:
+            all_langs_this_episode.append(t["language"])
+    folder_id = get_or_create_vidara_folder(series_name, season_num, quality, all_langs_this_episode)
+
     try:
         if subtitle_candidates:
             links_all = []
@@ -898,7 +910,6 @@ def process_episode_file(jwt, tmdb_id, series_name, season_num, episode_num,
                 # Any OCR'd (PGS -> SRT) tracks get swapped in here
                 # instead of the raw bitmap stream.
                 remux_single_audio(source_path, output_path, track, subtitle_tracks, subtitle_srt_overrides)
-                folder_id = get_or_create_vidara_folder(series_name, season_num, quality, lang)
                 video_url, filecode = upload_to_vidara(output_path, output_name, folder_id)
             except Exception as e:
                 # Fatal: the video itself never made it up. Nothing to
@@ -1260,4 +1271,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-  
